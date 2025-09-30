@@ -1,0 +1,7 @@
+2025-10-01
+
+- Streamlit freeze traced to Vega-Lite "Infinity extent" warnings when the time series only has a single `YYYYMM` value (202408) across `monthly_basics`, `monthly_momentum`, `monthly_volatility`.
+- ETL output is sane: no NaN in `cv_p_per_m2`; momentum is 0 because the dataset lacks at least 4 sequential months.
+- Front-end guardrail needed: have `safe_line_chart` / `safe_area_chart` bail out with a notice if fewer than 2 distinct timestamps are available.
+- Data-side fix: rerun ETL with additional months (or seed sample months) so charts have multiple points; clear Streamlit cache before retry.
+- Pending checks: capture browser console stack trace if UI still hangs after adding data; consider upgrading Streamlit/Altair if warnings persist.
