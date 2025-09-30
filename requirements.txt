@@ -1,0 +1,6 @@
+pandas>=2.2
+numpy>=1.26
+streamlit>=1.32
+pyarrow>=15.0
+duckdb>=0.9
+python-dotenv>=1.0

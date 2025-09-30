@@ -1,0 +1,44 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# IDE & tooling metadata
+.vscode/
+.idea/
+*.code-workspace
+
+# Streamlit cache & secrets
+.streamlit/secrets.toml
+app/cache/
+
+# Data directories
+data/raw/
+data/reference/
+data/processed/
+
+# Test & coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+
+# OS metadata
+.DS_Store
+Thumbs.db
