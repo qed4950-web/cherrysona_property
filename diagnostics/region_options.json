@@ -1,0 +1,13 @@
+[
+  {
+    "name": "region_options",
+    "iteration": 1,
+    "row_count": 54761,
+    "count_ms": 113.67935900034354,
+    "sample_ms": 58.56391599991184,
+    "sample_rows": 5,
+    "sample_path": null,
+    "explain_path": null,
+    "error": null
+  }
+]

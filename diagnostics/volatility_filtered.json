@@ -1,0 +1,13 @@
+[
+  {
+    "name": "monthly_volatility",
+    "iteration": 1,
+    "row_count": 581310,
+    "count_ms": 18.420314999275433,
+    "sample_ms": null,
+    "sample_rows": null,
+    "sample_path": null,
+    "explain_path": null,
+    "error": null
+  }
+]

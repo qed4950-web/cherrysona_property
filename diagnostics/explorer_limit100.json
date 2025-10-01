@@ -1,0 +1,13 @@
+[
+  {
+    "name": "explorer",
+    "iteration": 1,
+    "row_count": 335,
+    "count_ms": 43.52844900040509,
+    "sample_ms": 238.9937980005925,
+    "sample_rows": 100,
+    "sample_path": null,
+    "explain_path": null,
+    "error": null
+  }
+]

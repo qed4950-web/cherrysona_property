@@ -1,0 +1,57 @@
+[
+  {
+    "name": "monthly_basics",
+    "iteration": 1,
+    "row_count": 581310,
+    "count_ms": 12.407460000758874,
+    "sample_ms": 7.812200999978813,
+    "sample_rows": 100,
+    "sample_path": null,
+    "explain_path": null,
+    "error": null
+  },
+  {
+    "name": "monthly_momentum",
+    "iteration": 1,
+    "row_count": 581310,
+    "count_ms": 4.999314998713089,
+    "sample_ms": 9.86329800070962,
+    "sample_rows": 100,
+    "sample_path": null,
+    "explain_path": null,
+    "error": null
+  },
+  {
+    "name": "monthly_volatility",
+    "iteration": 1,
+    "row_count": 581310,
+    "count_ms": 11.779623000620632,
+    "sample_ms": 21.54584400159365,
+    "sample_rows": 100,
+    "sample_path": null,
+    "explain_path": null,
+    "error": null
+  },
+  {
+    "name": "explorer",
+    "iteration": 1,
+    "row_count": 333,
+    "count_ms": 33.08116500011238,
+    "sample_ms": 222.1733589994983,
+    "sample_rows": 100,
+    "sample_path": null,
+    "explain_path": null,
+    "error": null
+  },
+  {
+    "name": "region_options",
+    "iteration": 1,
+    "row_count": 54761,
+    "count_ms": 54.1197580005246,
+    "sample_ms": 57.25990499922773,
+    "sample_rows": 100,
+    "sample_path": null,
+    "explain_path": null,
+    "error": null
+  }
+]
