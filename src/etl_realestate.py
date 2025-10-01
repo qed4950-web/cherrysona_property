@@ -18,8 +18,10 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 import csv
+
+from pipelines.example_split_raw import split_by_contract_month
 
 import numpy as np
 import pandas as pd
@@ -49,7 +51,7 @@ COLMAP: Dict[str, List[str]] = {
 }
 
 DATE_IN_NAME = re.compile(r"(\d{8})")
-K_CONVERSION = 100  # 월세 → 보증금 환산 계수
+K_CONVERSION = 100  # 월세 -> 보증금 환산 계수
 AREA_BUCKETS = [0, 30, 60, 85, 135, 10_000]
 
 TRANSACTION_EXPORT_COLUMNS = [
@@ -120,6 +122,17 @@ def parse_args() -> argparse.Namespace:
         help="Directory to write parquet outputs to.",
     )
     parser.add_argument(
+        "--split-only",
+        action="store_true",
+        help="원본을 계약년월 단위 파일로 분할만 수행하고 나머지 ETL은 생략합니다.",
+    )
+    parser.add_argument(
+        "--split-format",
+        choices=["csv", "parquet", "both"],
+        default="csv",
+        help="split-only 모드에서 생성할 출력 포맷을 선택합니다.",
+    )
+    parser.add_argument(
         "--output-duckdb",
         type=Path,
         default=None,
@@ -159,6 +172,46 @@ def list_source_files(data_root: Path, legacy: bool, max_files: Optional[int]) -
             sources.append(SourceFile(fp, guess, detect_snapshot_from_filename(fp.name)))
 
     return sources
+
+
+
+def resolve_split_formats(option: str) -> Tuple[str, ...]:
+    if option == "parquet":
+        return ("parquet",)
+    if option == "both":
+        return ("csv", "parquet")
+    return ("csv",)
+
+
+def run_split_only_mode(
+    sources: List[SourceFile], output_dir: Path, export_formats: Tuple[str, ...]
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    total_contracts = 0
+    for source in sources:
+        snapshot = (
+            source.snapshot_date.strftime("%Y%m%d") if source.snapshot_date is not None else None
+        )
+        try:
+            results = split_by_contract_month(
+                raw_path=source.path,
+                processed_dir=output_dir,
+                snapshot=snapshot,
+                export_formats=export_formats,
+            )
+        except Exception as exc:  # pragma: no cover - defensive log
+            print(f"[split-only] 실패: {source.path.name} -> {exc}")
+            continue
+
+        total_contracts += len(results)
+        preview = ", ".join(r.contract_ym for r in results[:3]) or "-"
+        print(
+            f"[split-only] {source.path.name} -> {len(results)}건 (미리보기: {preview})"
+        )
+
+    print(
+        f"[split-only] 총 {len(sources)}개 원본에서 {total_contracts}건 계약년월 파일 생성 완료"
+    )
 
 
 def guess_src_type(filename: str) -> str:
@@ -591,6 +644,11 @@ def main() -> None:
 
     if not sources:
         print("No source files discovered; check data-root or enable --legacy-glob")
+        return
+
+    if args.split_only:
+        formats = resolve_split_formats(args.split_format)
+        run_split_only_mode(sources, args.output_dir, formats)
         return
 
     raw_df = load_sources(sources)

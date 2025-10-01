@@ -1,36 +1,34 @@
 **전처리 동화 이야기**
 
-- **`src/etl_realestate.py:1` 파일을 열었어요.** 이 안에는 데이터 친구들을 손질하는 모든 마법이 들어 있어요.  
-- 가장 먼저, **`list_source_files()`**라는 요정이 `data/raw/` 안을 돌아다니며 CSV 친구들을 찾고, 이름을 보고 “너는 아파트 매매야!”, “너는 오피스텔 전월세야!”처럼 역할을 붙여줘요.  
-- **`read_source_dataframe()`**라는 요정은 CSV 문 앞에 붙어 있는 긴 안내문을 지나, 한글(예: `cp949`)로 잘 읽고, 표 머리(`NO, 시군구...`)를 정확히 찾아 “여기가 표의 시작이야!” 하고 알려줘요. 잘못 읽으면 다시 다른 방법으로 시도해요.  
-- 찾은 표는 **`standardize_columns()`**라는 탈의실로 가서 `거래금액(만원)`→`거래금액_만원`, `월세금(만원)`→`월세_만원`처럼 이름표를 모두 똑같이 바꿔서 헷갈리지 않게 해요.
+- **새로운 모험의 시작**: `src/pipelines/example_split_raw.py:1`에 있는 꼬마 요정이 등장했어요. 이 요정은 `split_by_contract_month()`(110) 마법으로 원본 CSV 하나를 계약년월별 파일로 쪼개고, 사용자가 원하면 CSV와 Parquet을 모두 만들어 줘요.
+  - `.venv/bin/python src/pipelines/example_split_raw.py --raw data/raw/apt_trade/아파트(매매)_실거래가.csv --format both`처럼 부르면, 월별 스냅샷들이 `data/processed/`에 차곡차곡 쌓여요.
 
-- 이제 **`normalize_frame()` (같은 파일:255)** 요정이 등장해요.  
-  - **지역 이름 정리**: `시도`, `시군구`, `읍면동`에서 불필요한 기호를 빼고, `서울특별시 송파구 방이동`을 `sido=서울특별시`, `sigungu=송파구`, `eupmyeondong=방이동`처럼 깔끔하게 나눠줘요.  
-  - **숫자 변환**: “59.7000”처럼 글자로 되어 있는 숫자를 진짜 숫자로 바꾸고, “1,234”에 있는 쉼표도 없애요.  
-  - **날짜 만들기**: `계약년월=202408`, `계약일=31`이면 진짜 날짜 `2024-08-31`을 만들어 `계약일자`라 부르고, 거기서 `YYYYMM`, `연도`, `월`, `분기`를 O-링 도장처럼 찍어요.  
-  - **면적 계산**: `전용면적_㎡`를 받아 평단위를 만들어 `면적_평`이라는 새 친구를 만들고, `가격_per_㎡`, `가격_per_평`도 계산해 줘요.  
-  - **전월세 계산**: 보증금과 월세가 있으면 `환산가_만원`(전체 보증금 느낌), `추정매입가_만원`, `연임대수입_만원`, `Yield_%`(수익률)을 계산해서 붙여 줘요.  
-  - **이상치 다듬기**: 너무 높은 값이나 낮은 값은 윈저라이즈라는 방법으로 살짝 다듬어 줘요.
+- **본편 전처리 마법사**: `src/etl_realestate.py:1`을 펼치면 모든 주인공들이 나와요. 이제 `--split-only` 옵션이 생겨서, 한꺼번에 돌리다 멈추는 일을 막기 위해 원본을 먼저 나눠 둘 수도 있답니다.
+  - `main()`(641)에 들어오면 `list_source_files()` 요정이 `data/raw/` 아래를 순회하며 CSV 친구들을 찾고, `--split-only`를 외치면 방금 만든 `split_by_contract_month` 마법사를 불러 월별 스냅샷만 빠르게 생성해요.
+  - 스냅샷만 끝내면 다음 단계에서 다시 `main()`을 부를 때 분할된 파일 없이도 전체 ETL을 이어갈 수 있어요.
 
-- 이렇게 꾸며진 표는 **`load_sources()`**에게 모이고, 중복 줄이 있으면 제거하고 하나의 큰 테이블(`raw_df`)로 합쳐줘요.
+- **CSV를 읽는 문지기**: `read_source_dataframe()`은 여러 인코딩을 시도해 표 머리를 찾아내고, 잘못 읽으면 친절하게 다른 방법을 시도해요.
+- **이름표 정리**: `standardize_columns()`는 `거래금액(만원)` 같은 이름을 `거래금액_만원`으로 통일해 혼란을 막아요.
 
-- 다음은 **`add_dimension_keys()` (같은 파일:321)**.  
-  - 지역 정보를 합쳐서 `geo_hash`, 건축년도+층을 합쳐 `building_hash`, 날짜를 숫자로 만든 `date_key`를 붙여요. 나중에 깔끔하게 연결하기 위한 열쇠들이에요.
+- **변환과 파생 계산**: `normalize_frame()`(255)부터 이어지는 함수들은 다음을 담당해요.
+  - 지역 이름을 `sido`, `sigungu`, `eupmyeondong`으로 깔끔히 나누고, 숫자처럼 생긴 글자를 진짜 숫자로 만들어요.
+  - `build_contract_date()`로 `계약년월`/`계약일`을 합쳐 날짜를 만들고, 거기서 `YYYYMM`, `연도`, `월`, `분기`를 도출해요.
+  - `전용면적_㎡`를 토대로 `면적_평`, `가격_per_㎡`, `가격_per_평`을 계산하고, 보증금·월세가 있으면 `환산가_만원`, `추정매입가_만원`, `Yield_%`까지 붙여 줘요.
+  - 이상치가 보이면 `winsorize()`로 살짝 다듬어 안정적인 수치를 만들어 줘요.
 
-- 이제 **`compute_monthly_basics()` (같은 파일:380)**가 월별로 그룹을 만들고 평균 가격, 거래 건수, 수익률, 취소율을 계산해요.  
-- **`compute_momentum()`**은 3개월 전보다 가격이 오르고 있는지 살피고, **`compute_volatility()`**는 변동성을 계산해요.
+- **차원 키 부여**: `add_dimension_keys()`(321)은 `geo_hash`, `building_hash`, `date_key`를 달아 나중에 빠르게 조인할 수 있도록 준비해요.
 
-- 다 만들어진 테이블은 저장할 차례!  
-  - `transactions.csv`, `monthly_basics.parquet`, `monthly_momentum.parquet`, `monthly_volatility.parquet`는 **`persist_parquet()`**와 **`persist_transactions_csv()`**가 저장해요.  
-  - `persist_duckdb()`는 DuckDB 라는 상자에 `fact_transactions`, `vw_monthly_basics` 같은 표를 만들어 Streamlit이 빨리 가져다 쓰게 해요.
+- **월별 분석**: `compute_monthly_basics()`(380)이 거래 건수와 평균 가격을, `compute_momentum()`과 `compute_volatility()`가 추세와 변동성을 계산해요.
 
-- 마지막으로, `main()`이 출발을 외쳐요.  
+- **저장 요정**: `persist_transactions_csv()`와 `persist_parquet()`가 `transactions.csv`, `monthly_basics.parquet`, `monthly_momentum.parquet`, `monthly_volatility.parquet`를 `data/processed/`에 저장하고, `persist_duckdb()`는 필요하면 DuckDB에도 저장해 Streamlit 대시보드가 빠르게 쓰게 해요.
+
+- **전체 실행 예시**:
   ```bash
   source .venv/bin/activate
-  python src/etl_realestate.py --data-root data/raw --legacy-glob \
-    --output-duckdb data/processed/realestate.duckdb
+  # 1) 원본을 월별 스냅샷으로만 분할
+  python src/etl_realestate.py --data-root data/raw --output-dir data/processed --split-only --split-format both
+  # 2) 전체 ETL 수행
+  python src/etl_realestate.py --data-root data/raw --output-dir data/processed --output-duckdb data/processed/realestate.duckdb
   ```
-  이렇게 하면 새 CSV들을 읽어와서 위 과정을 모두 실행하고, `data/processed/`에 결과 파일들을 예쁘게 배치해요.
 
-**즉, CSV → 이름표 통일 → 숫자·날짜·지역 정리 → 파생지표 계산 → 월별 집계 → 파일/DB 저장**이라는 여행을 `src/etl_realestate.py` 안의 여러 함수가 차례대로 진행해 준답니다.
+**정리하면:** `split_by_contract_month`로 안전하게 원본을 나눠 둔 뒤, `normalize -> 파생지표 -> 월별 집계 -> 저장` 순서로 ETL 여행이 이어져요. Streamlit 대시보드를 위한 모든 데이터는 이 여정 속에서 차곡차곡 준비된답니다.
