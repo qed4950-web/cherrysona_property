@@ -254,6 +254,7 @@ def load_explorer(
     ym_to: Optional[int] = None,
     limit: int = 2000,
 ) -> pd.DataFrame:
+    safe_limit = max(1, min(int(limit), 5000))
     if DUCKDB_PATH and duckdb is not None:
         query = """
             SELECT *
@@ -274,7 +275,7 @@ def load_explorer(
             query += " AND yyyymm <= ?"
             params.append(int(ym_to))
         query += " ORDER BY yyyymm LIMIT ?"
-        params.append(int(limit))
+        params.append(safe_limit)
         with duckdb.connect(DUCKDB_PATH, read_only=True) as con:
             return normalize_time_columns(
                 normalize_region_columns(con.execute(query, params).fetch_df())
@@ -290,7 +291,7 @@ def load_explorer(
         mask &= df["YYYYMM"] >= int(ym_from)
     if ym_to:
         mask &= df["YYYYMM"] <= int(ym_to)
-    result = df.loc[mask].sort_values("YYYYMM").head(limit)
+    result = df.loc[mask].sort_values("YYYYMM").head(safe_limit)
     return result
 
 

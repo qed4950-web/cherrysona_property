@@ -347,9 +347,16 @@ def derive_fields(df: pd.DataFrame) -> pd.DataFrame:
 
     if {"전용면적_㎡", "거래금액_만원"}.issubset(df.columns):
         bucketed = pd.cut(df["전용면적_㎡"], bins=AREA_BUCKETS)
-        df["거래금액_만원"] = (
-            df.groupby(bucketed)["거래금액_만원"].transform(winsorize)
+        bounds = (
+            df.groupby(bucketed)["거래금액_만원"]
+            .quantile([0.01, 0.99])
+            .unstack(level=-1)
+            .rename(columns={0.01: "lower", 0.99: "upper"})
         )
+        bucketed_str = bucketed.astype(str)
+        lower = bucketed_str.map(bounds["lower"]).fillna(-np.inf)
+        upper = bucketed_str.map(bounds["upper"]).fillna(np.inf)
+        df["거래금액_만원"] = df["거래금액_만원"].clip(lower=lower, upper=upper)
 
     return df
 
