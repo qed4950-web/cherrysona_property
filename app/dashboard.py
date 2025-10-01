@@ -6,12 +6,27 @@ mirrors the tab structure proposed in ``코드.md``.
 from __future__ import annotations
 
 import os
+import sys
+import time
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from src.utils.duckdb_queries import (
+    EXPLORER_COLUMNS,
+    fact_transactions as build_fact_transactions_query,
+    monthly_basics as build_monthly_basics_query,
+    monthly_momentum as build_monthly_momentum_query,
+    monthly_volatility as build_monthly_volatility_query,
+    region_options as build_region_options_query,
+)
 
 try:
     import duckdb  # type: ignore
@@ -24,13 +39,25 @@ except ImportError:  # pragma: no cover
 
 DATA_DIR = Path(os.environ.get("CHERRYSONA_DATA_DIR", "data/processed"))
 DUCKDB_PATH = os.environ.get("CHERRYSONA_DUCKDB")
+DEBUG_MODE = os.environ.get("CHERRYSONA_DEBUG", "0") in {"1", "true", "TRUE"}
+DEBUG_LOG_KEY = "__cherrysona_debug_log__"
+MAX_UI_ROWS = int(os.environ.get("CHERRYSONA_UI_MAX_ROWS", "120"))
+DEBUG_LOG_PATH_ENV = os.environ.get("CHERRYSONA_DEBUG_LOG")
+DEBUG_LOG_PATH = Path(DEBUG_LOG_PATH_ENV).expanduser() if DEBUG_LOG_PATH_ENV else None
+
+if DEBUG_MODE and DEBUG_LOG_PATH:
+    try:
+        DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with DEBUG_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write("\n--- Streamlit session started at %s ---\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    except Exception:  # pragma: no cover - logging failures shouldn't break app
+        pass
 
 MONTHLY_PATH = DATA_DIR / "monthly_basics.parquet"
 MOMENTUM_PATH = DATA_DIR / "monthly_momentum.parquet"
 VOLATILITY_PATH = DATA_DIR / "monthly_volatility.parquet"
 FACT_PARQUET_PATH = DATA_DIR / "transactions.parquet"
 FACT_CSV_PATH = DATA_DIR / "transactions.csv"
-
 
 def normalize_region_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -62,7 +89,41 @@ def normalize_time_columns(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-@st.cache_data(show_spinner=False)
+def sanitize_numeric(df: pd.DataFrame, columns: list[str] | None = None) -> pd.DataFrame:
+    if df.empty:
+        return df
+    result = df.copy()
+    target_cols: list[str]
+    if columns is not None:
+        target_cols = [col for col in columns if col in result.columns]
+    else:
+        target_cols = [
+            col
+            for col in result.columns
+            if pd.api.types.is_numeric_dtype(result[col])
+            or result[col].dtype == object
+        ]
+    for col in target_cols:
+        numeric_series = pd.to_numeric(result[col], errors="coerce")
+        if not pd.api.types.is_float_dtype(numeric_series.dtype):
+            numeric_series = numeric_series.astype("float64")
+        arr = numeric_series.to_numpy(dtype="float64")
+        mask = ~np.isfinite(arr)
+        if mask.any():
+            numeric_series = pd.Series(np.where(mask, np.nan, arr), index=numeric_series.index)
+        result[col] = numeric_series
+    return result
+
+
+def trim_for_ui(df: pd.DataFrame, *, sort_column: str = "YYYYMM") -> pd.DataFrame:
+    if df.empty or len(df) <= MAX_UI_ROWS:
+        return df
+    if sort_column in df.columns:
+        return df.sort_values(sort_column).tail(MAX_UI_ROWS)
+    return df.head(MAX_UI_ROWS)
+
+
+@st.cache_data(show_spinner=False, ttl=0 if DEBUG_MODE else None)
 def load_fact_frame() -> pd.DataFrame:
     if FACT_CSV_PATH.exists():
         df = pd.read_csv(FACT_CSV_PATH, parse_dates=["계약일자", "snapshot_date", "해제사유발생일"], dtype="object")
@@ -88,9 +149,21 @@ def load_fact_frame() -> pd.DataFrame:
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
-        return normalize_time_columns(normalize_region_columns(df))
+        result = sanitize_numeric(
+            normalize_time_columns(normalize_region_columns(df)),
+            columns=numeric_cols,
+        )
+        debug_log(f"load_fact_frame csv rows={len(result)}")
+        return result
     if FACT_PARQUET_PATH.exists():
-        return normalize_time_columns(normalize_region_columns(pd.read_parquet(FACT_PARQUET_PATH)))
+        result = sanitize_numeric(
+            normalize_time_columns(
+                normalize_region_columns(pd.read_parquet(FACT_PARQUET_PATH))
+            ),
+            columns=numeric_cols,
+        )
+        debug_log(f"load_fact_frame parquet rows={len(result)}")
+        return result
     return pd.DataFrame()
 
 
@@ -104,7 +177,67 @@ def read_parquet(path: Path) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
-@st.cache_data(show_spinner=False)
+def debug_log(message: str) -> None:
+    if not DEBUG_MODE:
+        return
+    logs = st.session_state.setdefault(DEBUG_LOG_KEY, [])
+    timestamp = time.strftime("%H:%M:%S")
+    entry = f"[{timestamp}] {message}"
+    logs.append(entry)
+    if DEBUG_LOG_PATH:
+        try:
+            DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with DEBUG_LOG_PATH.open("a", encoding="utf-8") as fh:
+                fh.write(entry + "\n")
+        except Exception:  # pragma: no cover - avoid breaking app due to logging
+            pass
+
+
+def clear_debug_log() -> None:
+    if DEBUG_LOG_KEY in st.session_state:
+        del st.session_state[DEBUG_LOG_KEY]
+
+
+@st.cache_resource(show_spinner=False, ttl=0 if DEBUG_MODE else None)
+def get_duckdb_connection(path: str | None):
+    """Return a per-session DuckDB connection managed by Streamlit."""
+    if duckdb is None:
+        raise RuntimeError("duckdb is not installed; run `pip install duckdb` to enable DB mode")
+    if not path:
+        raise RuntimeError("CHERRYSONA_DUCKDB env var is missing; cannot open DuckDB database")
+
+    debug_log(f"Opening DuckDB connection -> {path}")
+    connection = duckdb.connect(path, read_only=True)
+
+    def _cleanup() -> None:
+        try:
+            connection.close()
+            debug_log("DuckDB connection closed")
+        except duckdb.Error:
+            pass
+
+    st.on_session_end(_cleanup)
+    return connection
+
+
+def fetch_duckdb(query: str, params: list | tuple | None = None) -> pd.DataFrame:
+    """Execute ``query`` against the cached DuckDB connection and return a DataFrame."""
+    if duckdb is None or not DUCKDB_PATH:
+        raise RuntimeError("DuckDB connection requested but configuration is missing")
+
+    normalized_query = " ".join(query.split())
+    debug_log(f"Executing query: {normalized_query} | params={params or []}")
+    connection = get_duckdb_connection(DUCKDB_PATH)
+    start = time.perf_counter()
+    try:
+        result = connection.execute(query, params or []).fetch_df()
+    finally:
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        debug_log(f"Query finished in {elapsed_ms:.1f} ms")
+    return result
+
+
+@st.cache_data(show_spinner=False, ttl=0 if DEBUG_MODE else None)
 def load_monthly_basics(
     src_type: str,
     sido: Optional[str] = None,
@@ -121,34 +254,26 @@ def load_monthly_basics(
             "avg_yield_pct",
             "cancel_rate",
         ]
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df
+        return sanitize_numeric(df, numeric_cols)
 
     if DUCKDB_PATH and duckdb is not None:
-        query = """
-            SELECT * FROM vw_monthly_basics
-            WHERE src_type = ?
-        """
-        params = [src_type]
-        if sido:
-            query += " AND sido = ?"
-            params.append(sido)
-        if sigungu:
-            query += " AND sigungu = ?"
-            params.append(sigungu)
-        if ym_from:
-            query += " AND yyyymm >= ?"
-            params.append(int(ym_from))
-        if ym_to:
-            query += " AND yyyymm <= ?"
-            params.append(int(ym_to))
-        with duckdb.connect(DUCKDB_PATH, read_only=True) as con:
-            result = normalize_time_columns(
-                normalize_region_columns(con.execute(query, params).fetch_df())
+        spec = build_monthly_basics_query(
+            src_type,
+            sido=sido,
+            sigungu=sigungu,
+            ym_from=ym_from,
+            ym_to=ym_to,
+        )
+        result = normalize_time_columns(
+            normalize_region_columns(fetch_duckdb(spec.sql, list(spec.params)))
+        )
+        result = trim_for_ui(result)
+        debug_log(
+            "monthly_basics rows=%d filters={sido=%s,sigungu=%s,ym_from=%s,ym_to=%s}" % (
+                len(result), sido, sigungu, ym_from, ym_to
             )
-            return _cast_numeric(result)
+        )
+        return _cast_numeric(result)
 
     df = normalize_time_columns(normalize_region_columns(read_parquet(MONTHLY_PATH)))
     mask = df["src_type"] == src_type
@@ -161,10 +286,16 @@ def load_monthly_basics(
     if ym_to:
         mask &= df["YYYYMM"] <= int(ym_to)
     filtered = df.loc[mask].sort_values("YYYYMM")
+    filtered = trim_for_ui(filtered)
+    debug_log(
+        "monthly_basics-parquet rows=%d filters={sido=%s,sigungu=%s,ym_from=%s,ym_to=%s}" % (
+            len(filtered), sido, sigungu, ym_from, ym_to
+        )
+    )
     return _cast_numeric(filtered)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=0 if DEBUG_MODE else None)
 def load_momentum(
     src_type: str,
     sido: Optional[str] = None,
@@ -173,39 +304,32 @@ def load_momentum(
     ym_to: Optional[int] = None,
 ) -> pd.DataFrame:
     def _cast_numeric(df: pd.DataFrame) -> pd.DataFrame:
-        for col in [
+        numeric_cols = [
             "YYYYMM",
             "avg_p_per_m2",
             "avg_p_per_m2_lag3",
             "mom_3m",
-        ]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df
+        ]
+        return sanitize_numeric(df, numeric_cols)
 
     if DUCKDB_PATH and duckdb is not None:
-        query = """
-            SELECT * FROM vw_monthly_momentum
-            WHERE src_type = ?
-        """
-        params = [src_type]
-        if sido:
-            query += " AND sido = ?"
-            params.append(sido)
-        if sigungu:
-            query += " AND sigungu = ?"
-            params.append(sigungu)
-        if ym_from:
-            query += " AND yyyymm >= ?"
-            params.append(int(ym_from))
-        if ym_to:
-            query += " AND yyyymm <= ?"
-            params.append(int(ym_to))
-        with duckdb.connect(DUCKDB_PATH, read_only=True) as con:
-            result = normalize_time_columns(
-                normalize_region_columns(con.execute(query, params).fetch_df())
+        spec = build_monthly_momentum_query(
+            src_type,
+            sido=sido,
+            sigungu=sigungu,
+            ym_from=ym_from,
+            ym_to=ym_to,
+        )
+        result = normalize_time_columns(
+            normalize_region_columns(fetch_duckdb(spec.sql, list(spec.params)))
+        )
+        result = trim_for_ui(result)
+        debug_log(
+            "monthly_momentum rows=%d filters={sido=%s,sigungu=%s,ym_from=%s,ym_to=%s}" % (
+                len(result), sido, sigungu, ym_from, ym_to
             )
-            return _cast_numeric(result)
+        )
+        return _cast_numeric(result)
 
     df = normalize_time_columns(normalize_region_columns(read_parquet(MOMENTUM_PATH)))
     mask = df["src_type"] == src_type
@@ -218,34 +342,68 @@ def load_momentum(
     if ym_to:
         mask &= df["YYYYMM"] <= int(ym_to)
     filtered = df.loc[mask].sort_values("YYYYMM")
+    filtered = trim_for_ui(filtered)
+    debug_log(
+        "monthly_momentum-parquet rows=%d filters={sido=%s,sigungu=%s,ym_from=%s,ym_to=%s}" % (
+            len(filtered), sido, sigungu, ym_from, ym_to
+        )
+    )
     return _cast_numeric(filtered)
 
 
-@st.cache_data(show_spinner=False)
-def load_volatility(src_type: str) -> pd.DataFrame:
+@st.cache_data(show_spinner=False, ttl=0 if DEBUG_MODE else None)
+def load_volatility(
+    src_type: str,
+    sido: Optional[str] = None,
+    sigungu: Optional[str] = None,
+    ym_from: Optional[int] = None,
+    ym_to: Optional[int] = None,
+) -> pd.DataFrame:
     def _cast_numeric(df: pd.DataFrame) -> pd.DataFrame:
-        for col in ["YYYYMM", "cv_p_per_m2", "avg_p_per_m2", "std_p_per_m2"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df
+        numeric_cols = ["YYYYMM", "cv_p_per_m2", "avg_p_per_m2", "std_p_per_m2"]
+        return sanitize_numeric(df, numeric_cols)
 
     if DUCKDB_PATH and duckdb is not None:
-        with duckdb.connect(DUCKDB_PATH, read_only=True) as con:
-            result = normalize_time_columns(
-                normalize_region_columns(
-                    con.execute(
-                        "SELECT * FROM vw_monthly_volatility WHERE src_type = ? ORDER BY yyyymm",
-                        [src_type],
-                    ).fetch_df()
-                )
+        spec = build_monthly_volatility_query(
+            src_type,
+            sido=sido,
+            sigungu=sigungu,
+            ym_from=ym_from,
+            ym_to=ym_to,
+        )
+        result = normalize_time_columns(
+            normalize_region_columns(
+                fetch_duckdb(spec.sql, list(spec.params))
             )
-            return _cast_numeric(result)
+        )
+        result = trim_for_ui(result)
+        debug_log(
+            "monthly_volatility rows=%d filters={sido=%s,sigungu=%s,ym_from=%s,ym_to=%s}" % (
+                len(result), sido, sigungu, ym_from, ym_to
+            )
+        )
+        return _cast_numeric(result)
     df = normalize_time_columns(normalize_region_columns(read_parquet(VOLATILITY_PATH)))
-    filtered = df[df["src_type"] == src_type].sort_values("YYYYMM")
+    mask = df["src_type"] == src_type
+    if sido:
+        mask &= df["sido"] == sido
+    if sigungu:
+        mask &= df["sigungu"] == sigungu
+    if ym_from:
+        mask &= df["YYYYMM"] >= int(ym_from)
+    if ym_to:
+        mask &= df["YYYYMM"] <= int(ym_to)
+    filtered = df.loc[mask].sort_values("YYYYMM")
+    filtered = trim_for_ui(filtered)
+    debug_log(
+        "monthly_volatility-parquet rows=%d filters={sido=%s,sigungu=%s,ym_from=%s,ym_to=%s}" % (
+            len(filtered), sido, sigungu, ym_from, ym_to
+        )
+    )
     return _cast_numeric(filtered)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=0 if DEBUG_MODE else None)
 def load_explorer(
     src_type: str,
     sido: Optional[str] = None,
@@ -253,33 +411,33 @@ def load_explorer(
     ym_from: Optional[int] = None,
     ym_to: Optional[int] = None,
     limit: int = 2000,
+    offset: int = 0,
+    sample: bool = True,
 ) -> pd.DataFrame:
     safe_limit = max(1, min(int(limit), 5000))
+    safe_offset = max(0, int(offset))
+    no_filter = not any([sido, sigungu, ym_from, ym_to])
+    effective_sample = sample or no_filter
     if DUCKDB_PATH and duckdb is not None:
-        query = """
-            SELECT *
-            FROM fact_transactions
-            WHERE src_type = ?
-        """
-        params = [src_type]
-        if sido:
-            query += " AND sido = ?"
-            params.append(sido)
-        if sigungu:
-            query += " AND sigungu = ?"
-            params.append(sigungu)
-        if ym_from:
-            query += " AND yyyymm >= ?"
-            params.append(int(ym_from))
-        if ym_to:
-            query += " AND yyyymm <= ?"
-            params.append(int(ym_to))
-        query += " ORDER BY yyyymm LIMIT ?"
-        params.append(safe_limit)
-        with duckdb.connect(DUCKDB_PATH, read_only=True) as con:
-            return normalize_time_columns(
-                normalize_region_columns(con.execute(query, params).fetch_df())
+        spec = build_fact_transactions_query(
+            src_type,
+            sido=sido,
+            sigungu=sigungu,
+            ym_from=ym_from,
+            ym_to=ym_to,
+            limit=safe_limit,
+            offset=safe_offset,
+            sample=effective_sample,
+        )
+        frame = normalize_time_columns(
+            normalize_region_columns(fetch_duckdb(spec.sql, list(spec.params)))
+        )
+        debug_log(
+            "explorer rows=%d sample=%s limit=%d offset=%d" % (
+                len(frame), effective_sample, safe_limit, safe_offset
             )
+        )
+        return frame
 
     df = load_fact_frame()
     mask = df["src_type"] == src_type
@@ -291,28 +449,61 @@ def load_explorer(
         mask &= df["YYYYMM"] >= int(ym_from)
     if ym_to:
         mask &= df["YYYYMM"] <= int(ym_to)
-    result = df.loc[mask].sort_values("YYYYMM").head(safe_limit)
+    filtered = df.loc[mask].sort_values("YYYYMM")
+    columns_present = [col for col in EXPLORER_COLUMNS if col in filtered.columns]
+    if effective_sample:
+        result = filtered.sample(n=min(safe_limit, len(filtered)), random_state=0)
+    else:
+        result = filtered.iloc[safe_offset : safe_offset + safe_limit]
+    if columns_present:
+        result = result[columns_present]
+    debug_log(
+        "explorer-parquet rows=%d sample=%s limit=%d offset=%d" % (
+            len(result), effective_sample, safe_limit, safe_offset
+        )
+    )
     return result
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=0 if DEBUG_MODE else None)
 def load_region_options() -> pd.DataFrame:
     if DUCKDB_PATH and duckdb is not None:
-        with duckdb.connect(DUCKDB_PATH, read_only=True) as con:
-            df = con.execute(
-                "SELECT DISTINCT src_type, sido AS 시도, sigungu AS 시군구 FROM fact_transactions"
-            ).fetch_df()
-            return df.drop_duplicates().sort_values(["src_type", "시도", "시군구"])
+        spec = build_region_options_query()
+        df = fetch_duckdb(spec.sql, list(spec.params))
+        debug_log(f"region_options rows={len(df)}")
+        return df.drop_duplicates().sort_values(["src_type", "시도", "시군구"])
 
     fact = load_fact_frame()
     if fact.empty:
         return pd.DataFrame(columns=["src_type", "시도", "시군구"])
-    return (
+    fallback = (
         fact[["src_type", "sido", "sigungu"]]
         .rename(columns={"sido": "시도", "sigungu": "시군구"})
         .drop_duplicates()
         .sort_values(["src_type", "시도", "시군구"])
     )
+    debug_log(f"region_options-parquet rows={len(fallback)}")
+    return fallback
+
+
+def clear_cached_functions() -> None:
+    targets = [
+        load_fact_frame,
+        load_monthly_basics,
+        load_momentum,
+        load_volatility,
+        load_explorer,
+        load_region_options,
+    ]
+    for fn in targets:
+        try:
+            fn.clear()
+        except Exception:
+            pass
+    try:
+        get_duckdb_connection.clear()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -371,9 +562,26 @@ with st.sidebar:
     st.caption("데이터 디렉터리: %s" % DATA_DIR)
     if DUCKDB_PATH:
         st.caption(f"DuckDB: {DUCKDB_PATH}")
+    if DEBUG_MODE:
+        st.divider()
+        st.caption("디버그 모드가 활성화되었습니다 (CHERRYSONA_DEBUG=1)")
+        if st.button("캐시 초기화 및 로그 지우기", type="secondary"):
+            clear_cached_functions()
+            clear_debug_log()
+            if hasattr(st, "rerun"):
+                st.rerun()
+            elif hasattr(st, "experimental_rerun"):
+                st.experimental_rerun()
+            else:
+                st.info("Streamlit을 새로고침해 주세요 (버전이 낮아 자동 새로고침 미지원)")
+        logs = st.session_state.get(DEBUG_LOG_KEY, [])
+        if logs:
+            st.text_area("DuckDB 로그", value="\n".join(logs[-200:]), height=240)
+        else:
+            st.caption("아직 디버그 로그가 없습니다.")
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=0 if DEBUG_MODE else None)
 def latest_metric(df: pd.DataFrame, column: str, default: float = float("nan")) -> float:
     if df.empty or column not in df.columns:
         return default
@@ -385,18 +593,19 @@ def latest_metric(df: pd.DataFrame, column: str, default: float = float("nan")) 
 # ---------------------------------------------------------------------------
 
 def safe_line_chart(df: pd.DataFrame, y_columns: list[str]) -> None:
-    subset = df.copy()
-    if "YYYYMM" in subset.columns:
-        subset["YYYYMM"] = pd.to_numeric(subset["YYYYMM"], errors="coerce")
-    for col in y_columns:
-        if col in subset.columns:
-            subset[col] = pd.to_numeric(subset[col], errors="coerce")
+    subset = sanitize_numeric(df, ["YYYYMM", *y_columns])
+    subset.dropna(subset=["YYYYMM"], inplace=True)
     subset.dropna(subset=y_columns, how="all", inplace=True)
     if subset.empty:
         st.info("시각화할 데이터가 없습니다.")
         return
-    chart_data = subset.set_index("YYYYMM")[y_columns]
-    chart_data = chart_data.replace([np.inf, -np.inf], np.nan).dropna(how="any")
+    chart_data = (
+        subset
+        .groupby("YYYYMM", dropna=False)[y_columns]
+        .mean()
+        .sort_index()
+    )
+    chart_data = sanitize_numeric(chart_data, y_columns).dropna(how="all")
     if chart_data.empty:
         st.info("시각화할 데이터가 없습니다.")
         return
@@ -407,16 +616,19 @@ def safe_area_chart(df: pd.DataFrame, y_column: str) -> None:
     if y_column not in df.columns:
         st.info("시각화할 데이터가 없습니다.")
         return
-    series = pd.to_numeric(df[y_column], errors="coerce")
-    subset = df.copy()
-    if "YYYYMM" in subset.columns:
-        subset["YYYYMM"] = pd.to_numeric(subset["YYYYMM"], errors="coerce")
-    subset[y_column] = series
+    subset = sanitize_numeric(df, ["YYYYMM", y_column])
+    subset.dropna(subset=["YYYYMM"], inplace=True)
     subset.dropna(subset=[y_column], inplace=True)
     if subset.empty:
         st.info("시각화할 데이터가 없습니다.")
         return
-    chart_data = subset.set_index("YYYYMM")[[y_column]].replace([np.inf, -np.inf], np.nan).dropna()
+    chart_data = (
+        subset
+        .groupby("YYYYMM", dropna=False)[[y_column]]
+        .mean()
+        .sort_index()
+    )
+    chart_data = sanitize_numeric(chart_data, [y_column]).dropna(how="all")
     if chart_data.empty:
         st.info("시각화할 데이터가 없습니다.")
         return
@@ -461,7 +673,7 @@ with tab_vc:
 with tab_ro:
     st.subheader("RO 보드 (리스크 & 운영)")
     basics = load_monthly_basics(src_type, selected_sido, selected_sigungu, date_from_int, date_to_int)
-    volatility = load_volatility(src_type)
+    volatility = load_volatility(src_type, selected_sido, selected_sigungu, date_from_int, date_to_int)
     if volatility.empty:
         st.info("변동성 데이터를 찾을 수 없습니다.")
     else:
@@ -470,13 +682,22 @@ with tab_ro:
         st.info("취소율 데이터를 찾을 수 없습니다.")
     else:
         cancel_df = basics.rename(columns={"cancel_rate": "취소율"})
-        subset = cancel_df.copy()
-        subset["취소율"] = pd.to_numeric(subset["취소율"], errors="coerce")
+        subset = sanitize_numeric(cancel_df, ["YYYYMM", "취소율"])
         subset.dropna(subset=["취소율"], inplace=True)
         if subset.empty:
             st.info("취소율 데이터를 찾을 수 없습니다.")
         else:
-            st.bar_chart(subset.set_index("YYYYMM")["취소율"], height=240)
+            bar_data = (
+                subset
+                .groupby("YYYYMM", dropna=False)["취소율"]
+                .mean()
+                .sort_index()
+            )
+            bar_data = sanitize_numeric(bar_data.to_frame(), ["취소율"])["취소율"].dropna()
+            if bar_data.empty:
+                st.info("취소율 데이터를 찾을 수 없습니다.")
+            else:
+                st.bar_chart(bar_data, height=240)
 
 with tab_persona:
     st.subheader("Persona 보드")
@@ -488,9 +709,14 @@ with tab_persona:
                 st.info("데이터가 부족합니다.")
     else:
         top_yield = basics.sort_values("avg_yield_pct", ascending=False).head(20)
+        if len(top_yield) == 20:
+            st.caption("상위 20건까지만 미리보기로 제한됩니다.")
         with persona_tabs[0]:
             st.caption("Yield↑, 변동성↓, 취소율↓ 조건을 우선 적용")
-            st.dataframe(top_yield[["sido", "sigungu", "eupmyeondong", "YYYYMM", "avg_yield_pct", "cancel_rate"]])
+            st.dataframe(
+                top_yield[["sido", "sigungu", "eupmyeondong", "YYYYMM", "avg_yield_pct", "cancel_rate"]],
+                height=360,
+            )
         with persona_tabs[1]:
             st.caption("상업/준상업 구간: 구축 + 저층 후보 체크")
             st.info("추가 필터 (건축년도, 층) 연동 예정")
@@ -503,19 +729,60 @@ with tab_persona:
 
 with tab_explorer:
     st.subheader("Explorer (원천 레코드)")
-    limit = st.number_input("최대 행 수", min_value=100, max_value=10_000, value=2000, step=100)
-    explorer_df = load_explorer(
-        src_type,
-        selected_sido,
-        selected_sigungu,
-        date_from_int,
-        date_to_int,
-        limit=int(limit),
-    )
-    if explorer_df.empty:
-        st.info("조건에 해당하는 레코드가 없습니다.")
+    has_filter = any([selected_sido, selected_sigungu, date_from_int, date_to_int])
+    with st.form("explorer_form", border=False):
+        limit = st.number_input(
+            "최대 행 수",
+            min_value=100,
+            max_value=2_000,
+            value=100,
+            step=50,
+        )
+        offset = st.number_input(
+            "오프셋",
+            min_value=0,
+            value=0,
+            step=250,
+            help="페이지 이동에 이용됩니다. 샘플 모드 해제 시에만 적용돼요.",
+        )
+        sample_mode = st.checkbox(
+            "랜덤 샘플로 보기",
+            value=True,
+            help="필터가 넓을 때는 샘플 모드가 안전합니다.",
+        )
+        submitted = st.form_submit_button("미리보기")
+
+    if not submitted:
+        st.info("조건을 설정하고 '미리보기' 버튼을 눌러 주세요.")
     else:
-        st.dataframe(explorer_df)
+        effective_sample = sample_mode or not has_filter
+        if not sample_mode and not has_filter:
+            st.warning("필터가 없어 랜덤 샘플로 자동 전환했습니다.")
+        explorer_df = load_explorer(
+            src_type,
+            selected_sido,
+            selected_sigungu,
+            date_from_int,
+            date_to_int,
+            limit=int(limit),
+            offset=int(offset),
+            sample=effective_sample,
+        )
+        if explorer_df.empty:
+            st.info("조건에 해당하는 레코드가 없습니다.")
+        else:
+            caption = (
+                f"총 {len(explorer_df):,}건 미리보기 (최대 100행). "
+                + (
+                    "랜덤 샘플입니다."
+                    if effective_sample
+                    else f"오프셋 {offset:,}부터 표시합니다."
+                )
+            )
+            st.caption(caption)
+            st.dataframe(explorer_df.head(100), height=400)
+            if len(explorer_df) >= int(limit):
+                st.caption("전체 데이터를 내려받으려면 CSV/Parquet 파일을 직접 열어 확인하세요.")
 
 with tab_compare:
     st.subheader("Compare (후보 비교)")
