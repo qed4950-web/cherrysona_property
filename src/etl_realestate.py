@@ -152,6 +152,96 @@ AREA_FALLBACK_COLUMNS = (
     "대지면적_㎡",
 )
 
+ADDRESS_TOKEN_PATTERN = re.compile(r"(?:\d{1,2})?월|(?:\d{1,2})?일|주민등록|생년월일|도로명", re.IGNORECASE)
+
+
+def _init_metadata(df: pd.DataFrame) -> Dict[str, list]:
+    df.attrs.setdefault("imputations", [])
+    df.attrs.setdefault("drops", [])
+    df.attrs.setdefault("issues", [])
+    return df.attrs
+
+
+def _log_imputation(df: pd.DataFrame, column: str, method: str, count: int) -> None:
+    if count <= 0:
+        return
+    meta = _init_metadata(df)
+    meta["imputations"].append({"column": column, "method": method, "count": int(count)})
+
+
+def _log_drop(df: pd.DataFrame, reason: str, count: int) -> None:
+    if count <= 0:
+        return
+    meta = _init_metadata(df)
+    meta["drops"].append({"reason": reason, "count": int(count)})
+
+
+def _assign_meta(source: pd.DataFrame, target: pd.DataFrame) -> pd.DataFrame:
+    """Copy attrs from source dataframe to target and return target."""
+
+    target.attrs = source.attrs
+    return target
+
+
+def _log_issue(df: pd.DataFrame, issue: str, count: int) -> None:
+    if count <= 0:
+        return
+    meta = _init_metadata(df)
+    meta["issues"].append({"issue": issue, "count": int(count)})
+
+
+def fill_with_group_median(
+    df: pd.DataFrame,
+    column: str,
+    *,
+    group_cols: Sequence[str],
+    default_value: Optional[float] = None,
+    include_zero_as_missing: bool = False,
+) -> pd.DataFrame:
+    if column not in df.columns:
+        return df
+
+    series = df[column]
+    if include_zero_as_missing:
+        missing_mask = series.isna() | (series == 0)
+    else:
+        missing_mask = series.isna()
+    if not missing_mask.any():
+        return df
+
+    valid_groups = [col for col in group_cols if col in df.columns]
+    if valid_groups:
+        group_medians = df.groupby(valid_groups)[column].transform("median")
+    else:
+        group_medians = pd.Series(np.nan, index=df.index)
+
+    replacements = missing_mask & group_medians.notna()
+    if replacements.any():
+        df.loc[replacements, column] = group_medians[replacements]
+        group_label = "+".join(valid_groups) if valid_groups else "global"
+        _log_imputation(df, column, f"median:{group_label}", int(replacements.sum()))
+
+    if default_value is not None:
+        remaining = df[column].isna()
+        if include_zero_as_missing:
+            remaining |= df[column] == 0
+        if remaining.any():
+            df.loc[remaining, column] = default_value
+            _log_imputation(df, column, f"default:{default_value}", int(remaining.sum()))
+
+    return df
+
+
+def clean_address_tokens(df: pd.DataFrame, column: str = "번지") -> pd.DataFrame:
+    if column not in df.columns:
+        return df
+    series = df[column].astype(str)
+    mask = series.str.contains(ADDRESS_TOKEN_PATTERN)
+    if mask.any():
+        df.loc[mask, column] = pd.NA
+        _log_issue(df, f"address_token_pattern:{column}", int(mask.sum()))
+    return df
+
 # ---------------------------------------------------------------------------
 # 데이터 구조
 # ---------------------------------------------------------------------------
@@ -398,7 +488,10 @@ def ensure_area_column(df: pd.DataFrame) -> pd.DataFrame:
     mask = df["전용면적_㎡"].isna() | (df["전용면적_㎡"] <= 0)
     for alt in AREA_FALLBACK_COLUMNS:
         if alt in df.columns:
-            df.loc[mask, "전용면적_㎡"] = df.loc[mask, alt]
+            candidates = mask & df[alt].notna()
+            if candidates.any():
+                df.loc[candidates, "전용면적_㎡"] = df.loc[candidates, alt]
+                _log_imputation(df, "전용면적_㎡", f"fallback:{alt}", int(candidates.sum()))
             mask = df["전용면적_㎡"].isna() | (df["전용면적_㎡"] <= 0)
             if not mask.any():
                 break
@@ -417,7 +510,10 @@ def ensure_transaction_amount(df: pd.DataFrame) -> pd.DataFrame:
             monthly_filled = monthly.fillna(0) if monthly is not None else 0
             fallback_amount = deposit_filled + monthly_filled * K_CONVERSION
             if isinstance(fallback_amount, pd.Series):
-                df.loc[mask_amount, "거래금액_만원"] = fallback_amount.loc[mask_amount]
+                replacements = mask_amount & fallback_amount.notna()
+                if replacements.any():
+                    df.loc[replacements, "거래금액_만원"] = fallback_amount.loc[replacements]
+                    _log_imputation(df, "거래금액_만원", "fallback:deposit_plus_rent", int(replacements.sum()))
     return df
 
 
@@ -593,7 +689,9 @@ def ensure_required_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def preprocess_dataframe(raw_df: pd.DataFrame, *, src_type: str) -> pd.DataFrame:
     df = standardize_columns(raw_df).copy()
+    _init_metadata(df)
     df = ensure_required_columns(df)
+    df = clean_address_tokens(df)
     df = normalize_region_columns(df)
     df["src_type"] = src_type
 
@@ -601,10 +699,35 @@ def preprocess_dataframe(raw_df: pd.DataFrame, *, src_type: str) -> pd.DataFrame
         if col in df.columns:
             df[col] = to_numeric(df[col])
 
+    if "층" in df.columns:
+        invalid_floor = df["층"].notna() & ((df["층"] < -5) | (df["층"] > 200))
+        if invalid_floor.any():
+            df.loc[invalid_floor, "층"] = np.nan
+            _log_imputation(df, "층", "drop_out_of_range", int(invalid_floor.sum()))
+
+    if "건축년도" in df.columns:
+        current_year = pd.Timestamp.today().year
+        invalid_year = df["건축년도"].notna() & (
+            (df["건축년도"] < 1960) | (df["건축년도"] > current_year)
+        )
+        if invalid_year.any():
+            df.loc[invalid_year, "건축년도"] = np.nan
+            _log_imputation(df, "건축년도", "drop_out_of_range", int(invalid_year.sum()))
+
     if "보증금_만원" in df.columns:
-        df["보증금_만원"] = df["보증금_만원"].fillna(0)
+        df = fill_with_group_median(
+            df,
+            "보증금_만원",
+            group_cols=("sigungu", "src_type"),
+            default_value=0.0,
+        )
     if "월세_만원" in df.columns:
-        df["월세_만원"] = df["월세_만원"].fillna(0)
+        df = fill_with_group_median(
+            df,
+            "월세_만원",
+            group_cols=("sigungu", "src_type"),
+            default_value=0.0,
+        )
 
     df = ensure_area_column(df)
     df = ensure_transaction_amount(df)
@@ -724,9 +847,16 @@ def preprocess_dataframe(raw_df: pd.DataFrame, *, src_type: str) -> pd.DataFrame
         df["is_new"] = False
         df["is_old"] = False
 
+    date_missing = df["계약일자"].isna().sum()
+    if date_missing:
+        _log_issue(df, "missing_contract_date", int(date_missing))
+
     essential_mask = df["전용면적_㎡"].notna() & (df["전용면적_㎡"] > 0)
     essential_mask &= df["추정매입가_만원"].notna() & (df["추정매입가_만원"] > 0)
-    df = df[essential_mask].copy()
+    removed = (~essential_mask).sum()
+    if removed:
+        _log_drop(df, "missing_core_metrics", int(removed))
+    df = _assign_meta(df, df[essential_mask].copy())
 
     df.replace({np.inf: np.nan, -np.inf: np.nan}, inplace=True)
     return df
@@ -735,6 +865,7 @@ def preprocess_dataframe(raw_df: pd.DataFrame, *, src_type: str) -> pd.DataFrame
 def drop_duplicate_transactions(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
+    original_len = len(df)
     subset = [
         col
         for col in [
@@ -750,7 +881,11 @@ def drop_duplicate_transactions(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns
     ]
     if subset:
-        return df.drop_duplicates(subset=subset)
+        deduped = df.drop_duplicates(subset=subset)
+        removed = original_len - len(deduped)
+        if removed:
+            _log_drop(df, "duplicate_transactions", removed)
+        return _assign_meta(df, deduped)
     return df
 
 
@@ -809,7 +944,7 @@ def compute_monthly_basics(df: pd.DataFrame) -> pd.DataFrame:
     )
     monthly["std_p_per_m2"] = monthly["std_p_per_m2"].fillna(0)
     monthly["cancel_rate"] = monthly["cancel_rate"].fillna(0)
-    return monthly
+    return monthly.loc[:, ~monthly.columns.str.fullmatch("index")].reset_index(drop=True)
 
 
 def compute_momentum(monthly: pd.DataFrame) -> pd.DataFrame:
@@ -822,7 +957,8 @@ def compute_momentum(monthly: pd.DataFrame) -> pd.DataFrame:
     monthly["mom_3m"] = monthly["avg_p_per_m2"] / monthly["avg_p_per_m2_lag3"] - 1
     monthly.loc[monthly["avg_p_per_m2_lag3"].isna(), "mom_3m"] = 0
     monthly.loc[monthly["mom_3m"].replace([np.inf, -np.inf], np.nan).isna(), "mom_3m"] = 0
-    return monthly
+    monthly = monthly.loc[:, ~monthly.columns.str.fullmatch("index")]  # drop stray index column
+    return monthly.reset_index(drop=True)
 
 
 def compute_volatility(monthly: pd.DataFrame) -> pd.DataFrame:
@@ -831,7 +967,8 @@ def compute_volatility(monthly: pd.DataFrame) -> pd.DataFrame:
     vol = monthly.copy()
     vol["cv_p_per_m2"] = vol["std_p_per_m2"] / vol["avg_p_per_m2"].replace(0, np.nan)
     vol["cv_p_per_m2"] = vol["cv_p_per_m2"].replace([np.inf, -np.inf], np.nan).fillna(0)
-    return vol
+    vol = vol.loc[:, ~vol.columns.str.fullmatch("index")]  # ensure index column removed
+    return vol.reset_index(drop=True)
 
 
 def sanitize_for_parquet(df: pd.DataFrame) -> pd.DataFrame:
@@ -852,20 +989,28 @@ def sanitize_for_parquet(df: pd.DataFrame) -> pd.DataFrame:
 def persist_parquet(df: pd.DataFrame, path: Path, *, index: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     df_to_write = sanitize_for_parquet(df)
+    df_to_write = df_to_write.drop(columns=["index"], errors="ignore")
     if duckdb is not None:
         con = duckdb.connect()
         try:
-            con.register("df_temp", df_to_write.reset_index(drop=index))
+            con.register("df_temp", df_to_write.reset_index(drop=True))
             con.execute(f"COPY df_temp TO '{path.as_posix()}' (FORMAT PARQUET)")
         finally:
             con.close()
     else:
-        df_to_write.to_parquet(path, index=index)
+        df_to_write.reset_index(drop=True).to_parquet(path, index=False)
 
 
 def persist_transactions_csv(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, index=False)
+    out = df.copy()
+    datetime_cols = out.select_dtypes(include="datetime64[ns]").columns
+    for col in datetime_cols:
+        out[col] = out[col].dt.strftime("%Y-%m-%d")
+    string_like = out.select_dtypes(include="object").columns
+    if len(string_like) > 0:
+        out[string_like] = out[string_like].fillna("")
+    out.to_csv(path, index=False, na_rep="")
 
 
 def persist_duckdb(
@@ -959,6 +1104,14 @@ def assess_data_quality(
             for issue in entry["issues"]
         )
         print(f"[WARN] {source_path.name}: quality issues -> {joined}")
+
+    meta = getattr(df, "attrs", {})
+    if meta.get("imputations"):
+        entry["imputations"] = meta["imputations"]
+    if meta.get("drops"):
+        entry["drops"] = meta["drops"]
+    if meta.get("issues"):
+        entry["extra_issues"] = meta["issues"]
 
     QUALITY_LOGS.append(entry)
 

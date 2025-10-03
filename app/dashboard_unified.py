@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""
-Streamlit Unified Real-Estate Dashboard
-- 데이터: ETL 산출물 (Parquet / CSV)
-- 기능: dashboard.py (KPI, VC, RO, Persona, Explorer) + streamlit_realestate_app.py (Top5 Insights)
-"""
+# Streamlit Unified Real-Estate Dashboard
+# - 데이터: ETL 산출물 (Parquet / CSV)
+# - 기능: dashboard.py (KPI, VC, RO, Persona, Explorer) + streamlit_realestate_app.py (Top5 Insights)
 
 import os
 from pathlib import Path
@@ -23,6 +21,15 @@ try:  # optional dependency for DuckDB backend
 except ImportError:  # pragma: no cover - optional runtime dependency
     duckdb = None
 
+
+def safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    """Divide two series while avoiding divide-by-zero and infinite results."""
+
+    denom = denominator.where(denominator > 0)
+    result = numerator.divide(denom)
+    return result.replace([np.inf, -np.inf], np.nan)
+
+
 GROUP_COL = "시군구"
 SIGUNGU_ALIASES = ("시군구", "sigungu")
 LOG_STORAGE_KEY = "__sidebar_logs__"
@@ -35,6 +42,19 @@ def push_log(message: str, level: str = "info") -> None:
         "level": level.upper(),
         "message": message,
     })
+
+
+def warn_missing_resource(path: Union[str, Path], label: str) -> None:
+    """Show a single warning per missing resource to avoid log spam."""
+
+    key = f"missing::{Path(path)}"
+    notified = st.session_state.setdefault("__missing_resource__", set())
+    if key in notified:
+        return
+    notified.add(key)
+    message = f"{label} 데이터를 찾을 수 없습니다. 경로를 확인하세요: {path}"
+    push_log(message, "warning")
+    st.warning(message, icon="⚠️")
 
 
 def _to_float(value) -> Optional[float]:
@@ -204,7 +224,7 @@ def load_volatility(backend: str = "Parquet", duckdb_path: Optional[str] = None)
 def load_transactions(backend: str = "Parquet", duckdb_path: Optional[str] = None):
     if backend == "DuckDB" and duckdb_path:
         return fetch_duckdb_table(duckdb_path, DUCKDB_TABLES["transactions"])
-    return pd.read_csv(FACT_PATH) if FACT_PATH.exists() else pd.DataFrame()
+    return pd.read_csv(FACT_PATH, low_memory=False) if FACT_PATH.exists() else pd.DataFrame()
 
 
 @st.cache_data(show_spinner=False, ttl=86400)
@@ -987,12 +1007,19 @@ def compute_composite_score(uv,momo,vol,w1=0.4,w2=0.3,w3=0.3):
     return comp.sort_values("composite_score",ascending=False)
 
 def compute_rent_metrics(df,annual_rate=0.055):
-    if not {"보증금_만원","월세_만원"}.issubset(df.columns):
+    if df.empty or not {"보증금_만원","월세_만원"}.issubset(df.columns):
         return pd.DataFrame()
     work = ensure_sigungu_named(df)
     if GROUP_COL not in work.columns:
         return pd.DataFrame()
     work = work.copy()
+    if "src_type" in work.columns:
+        lease_mask = work["src_type"].astype(str).str.contains("lease", case=False, na=False)
+        if not lease_mask.any():
+            return pd.DataFrame()
+        work = work[lease_mask]
+    if work[["보증금_만원", "월세_만원"]].sum().sum() == 0:
+        return pd.DataFrame()
     work["lease_equiv_monthly"] = work["보증금_만원"] * (annual_rate / 12.0)
     work["rent_gap_monthly"] = work["lease_equiv_monthly"] - work["월세_만원"]
 
@@ -1046,6 +1073,16 @@ with st.sidebar:
     momo_raw = ensure_yyyymm_numeric(load_momentum(data_backend, duckdb_path_input))
     vol_raw = ensure_yyyymm_numeric(load_volatility(data_backend, duckdb_path_input))
     fact_raw = ensure_yyyymm_numeric(load_transactions(data_backend, duckdb_path_input))
+
+    if data_backend == "Parquet":
+        if basics_raw.empty and not MONTHLY_PATH.exists():
+            warn_missing_resource(MONTHLY_PATH, "월간 기본 지표 (monthly_basics.parquet)")
+        if momo_raw.empty and not MOMENTUM_PATH.exists():
+            warn_missing_resource(MOMENTUM_PATH, "모멘텀 데이터 (monthly_momentum.parquet)")
+        if vol_raw.empty and not VOLATILITY_PATH.exists():
+            warn_missing_resource(VOLATILITY_PATH, "변동성 데이터 (monthly_volatility.parquet)")
+        if fact_raw.empty and not FACT_PATH.exists():
+            warn_missing_resource(FACT_PATH, "거래 원장 (transactions.csv)")
 
     st.markdown("### 📂 데이터 선택")
     src_type = st.selectbox(
@@ -1137,6 +1174,16 @@ geo_centroids = load_geo_centroids()
 policy_raw = load_policy_risk()
 lifestyle_raw = load_lifestyle_scores()
 sigungu_boundaries = load_sigungu_boundaries()
+
+if geo_centroids.empty and not (CENTROID_PARQUET.exists() or CENTROID_CSV.exists()):
+    warn_missing_resource(CENTROID_PARQUET if CENTROID_PARQUET.exists() else CENTROID_CSV, "시군구 좌표 데이터")
+if policy_raw.empty and not POLICY_PATH.exists():
+    warn_missing_resource(POLICY_PATH, "정책/금리 레퍼런스 (policy_risk.csv)")
+if lifestyle_raw.empty and not LIFESTYLE_PATH.exists():
+    warn_missing_resource(LIFESTYLE_PATH, "생활점수 레퍼런스 (lifestyle_scores.csv)")
+if not sigungu_boundaries and not BOUNDARY_PATH.exists():
+    warn_missing_resource(BOUNDARY_PATH, "시군구 경계 GeoJSON")
+
 lifestyle = filter_by_regions(lifestyle_raw, region_selection)
 policy_filtered = filter_by_regions(policy_raw, region_selection)
 aggregate_charts = region_mode == "전체"
