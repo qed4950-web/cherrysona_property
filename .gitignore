@@ -23,6 +23,7 @@ env/
 *.code-workspace
 
 # Streamlit cache & secrets
+.streamlit/
 .streamlit/secrets.toml
 app/cache/
 
@@ -30,6 +31,16 @@ app/cache/
 data/raw/
 data/reference/
 data/processed/
+
+# Legacy or local-only assets
+app/예전/
+docs/AGENTS.md
+docs/README.md
+docs/insight_cycle_playbook.md
+docs/persona_metrics.md
+docs/없는데이터로해보기1차.md
+docs/코드.md
+docs/인사이트 구성.md
 
 # Test & coverage artifacts
 .pytest_cache/
