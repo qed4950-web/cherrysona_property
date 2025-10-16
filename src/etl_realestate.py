@@ -44,7 +44,16 @@ COL_ALIASES: Dict[str, str] = {
         "법정동코드": ["법정동코드", "법정동 코드", "법정코드"],
         "건축년도": ["건축년도", "건축 연도", "준공년도"],
         "층": ["층", "해당층"],
-        "전용면적_㎡": ["전용면적(㎡)", "전용면적", "면적(㎡)", "계약면적", "계약면적(㎡)", "계약면적_㎡"],
+        "전용면적_㎡": [
+            "전용면적(㎡)",
+            "전용면적",
+            "면적(㎡)",
+            "계약면적",
+            "계약면적(㎡)",
+            "계약면적_㎡",
+            "전용/연면적(㎡)",
+            "전용/연면적",
+        ],
         "연면적_㎡": ["연면적", "연면적(㎡)", "연면적_㎡"],
         "대지면적_㎡": ["대지면적", "대지면적(㎡)", "대지 면적"],
         "거래금액_만원": ["거래금액(만원)", "거래금액", "금액(만원)", "매매금액(만원)"],
@@ -106,6 +115,10 @@ TRANSACTION_EXPORT_COLUMNS: Sequence[str] = (
     "price_per_m2",
     "price_per_pyeong",
     "Yield_%",
+    "yield_imputed",
+    "transaction_amount_imputed",
+    "transaction_amount_from_trade",
+    "transaction_amount_trade_diff_days",
     "floor_insight_enabled",
     "계약일자",
     "YYYYMM",
@@ -125,6 +138,9 @@ TRANSACTION_EXPORT_COLUMNS: Sequence[str] = (
     "contract_stability_score",
     "is_new",
     "is_old",
+    "lot_main",
+    "lot_sub",
+    "property_key",
     "geo_hash",
     "date_key",
     "building_hash",
@@ -147,10 +163,20 @@ AREA_BUCKET_LABELS = ["소형", "중형", "중대형", "대형"]
 FLOOR_BUCKET_BINS = [-np.inf, 5, 15, np.inf]
 FLOOR_BUCKET_LABELS = ["저층", "중층", "고층"]
 K_CONVERSION = 100
+YIELD_PRIMARY_WINDOW_DAYS = 90
+YIELD_SECONDARY_WINDOW_DAYS = 180
+
 AREA_FALLBACK_COLUMNS = (
     "연면적_㎡",
     "대지면적_㎡",
 )
+
+LOT_NUMBER_COLUMN = "번지"
+PROPERTY_KEY_REQUIRED_COMPONENTS = ("sido", "sigungu", "eupmyeondong", "lot_main", "lot_sub")
+PROPERTY_OPTIONAL_SOURCE_COLUMNS = ("동", "호")
+PROPERTY_KEY_MISSING_VALUE = "missing"
+DUAL_PROPERTY_PREFIXES = {"apt", "offi", "row", "det"}
+PROPERTY_MATCH_TOLERANCE = 1.5
 
 ADDRESS_TOKEN_PATTERN = re.compile(r"(?:\d{1,2})?월|(?:\d{1,2})?일|주민등록|생년월일|도로명", re.IGNORECASE)
 
@@ -241,6 +267,190 @@ def clean_address_tokens(df: pd.DataFrame, column: str = "번지") -> pd.DataFra
         df.loc[mask, column] = pd.NA
         _log_issue(df, f"address_token_pattern:{column}", int(mask.sum()))
     return df
+
+
+def _normalize_property_component(series: pd.Series) -> pd.Series:
+    normalized = series.fillna("")
+    normalized = normalized.astype(str).str.strip().str.lower()
+    normalized = normalized.replace({"nan": "", "none": ""})
+    return normalized
+
+
+def _split_lot_number(value: object) -> Tuple[str, str]:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "", ""
+    text = str(value).strip()
+    if not text:
+        return "", ""
+    cleaned = re.sub(r"[^0-9-]", "", text)
+    if not cleaned:
+        return "", ""
+    if "-" in cleaned:
+        main, sub = cleaned.split("-", 1)
+    else:
+        main, sub = cleaned, "0"
+    main = main.strip()
+    sub = sub.strip()
+    main_digits = re.sub(r"[^0-9]", "", main)
+    sub_digits = re.sub(r"[^0-9]", "", sub)
+    if main_digits:
+        try:
+            main_digits = str(int(main_digits))
+        except ValueError:
+            main_digits = main_digits.lstrip("0") or "0"
+    if sub_digits:
+        try:
+            sub_digits = str(int(sub_digits))
+        except ValueError:
+            sub_digits = sub_digits.lstrip("0") or "0"
+    return main_digits, sub_digits or "0"
+
+
+def add_lot_components(df: pd.DataFrame, column: str = LOT_NUMBER_COLUMN) -> pd.DataFrame:
+    if column not in df.columns:
+        df["lot_main"] = ""
+        df["lot_sub"] = ""
+        return df
+
+    series = df[column].astype(str).fillna("").str.strip()
+    # remove known noise before splitting
+    cleaned = series.replace({"nan": "", "None": "", "미상": ""})
+    raw_values = cleaned.apply(_split_lot_number)
+    lot_pairs = raw_values.tolist()
+    if len(lot_pairs) == 0:
+        df["lot_main"] = ""
+        df["lot_sub"] = ""
+        return df
+    lot_main, lot_sub = zip(*lot_pairs)
+    df["lot_main"] = pd.Series(lot_main, index=df.index, dtype="string")
+    df["lot_sub"] = pd.Series(lot_sub, index=df.index, dtype="string")
+    df["lot_main"] = df["lot_main"].replace({"<NA>": ""}).fillna("")
+    df["lot_sub"] = df["lot_sub"].replace({"<NA>": "0"}).fillna("0")
+    return df
+
+
+def append_property_key(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        if "property_key" not in df.columns:
+            df["property_key"] = PROPERTY_KEY_MISSING_VALUE
+        if "lot_main" not in df.columns:
+            df["lot_main"] = PROPERTY_KEY_MISSING_VALUE
+        if "lot_sub" not in df.columns:
+            df["lot_sub"] = "0"
+        return df
+
+    if "lot_main" not in df.columns or "lot_sub" not in df.columns:
+        df = add_lot_components(df)
+
+    normalized_components: Dict[str, pd.Series] = {}
+    for col in PROPERTY_KEY_REQUIRED_COMPONENTS:
+        if col not in df.columns:
+            df[col] = ""
+        series = _normalize_property_component(df[col])
+        if col == "lot_main":
+            series = series.replace("", PROPERTY_KEY_MISSING_VALUE)
+        if col == "lot_sub":
+            series = series.replace("", "0")
+        normalized_components[col] = series
+
+    key = normalized_components[PROPERTY_KEY_REQUIRED_COMPONENTS[0]].copy()
+    for col in PROPERTY_KEY_REQUIRED_COMPONENTS[1:]:
+        key = key + "|" + normalized_components[col]
+
+    for optional_col in PROPERTY_OPTIONAL_SOURCE_COLUMNS:
+        if optional_col in df.columns:
+            optional_series = _normalize_property_component(df[optional_col])
+            key = key + "|" + optional_series
+        else:
+            key = key + "|"
+
+    key = key.str.replace(r"\|{2,}", "|", regex=True)
+    key = key.str.replace(r"^\|+", "", regex=True)
+    key = key.str.replace(r"\|+$", "", regex=True)
+    key = key.replace("", PROPERTY_KEY_MISSING_VALUE)
+    key = key.fillna(PROPERTY_KEY_MISSING_VALUE)
+
+    df["property_key"] = key.astype("string")
+    df["lot_main"] = normalized_components["lot_main"].astype("string")
+    df["lot_sub"] = normalized_components["lot_sub"].astype("string")
+    return df
+
+
+def _compute_property_match_stats(
+    df: pd.DataFrame,
+    tolerance: float,
+) -> Tuple[set[str], List[Dict[str, Any]]]:
+    if df.empty or "property_key" not in df.columns:
+        return set(), []
+
+    property_keys = df["property_key"].fillna(PROPERTY_KEY_MISSING_VALUE)
+    asset_prefix = df["src_type"].astype(str).str.split("_", n=1).str[0]
+
+    matched_keys: set[str] = set()
+    stats: List[Dict[str, Any]] = []
+
+    for asset in sorted(DUAL_PROPERTY_PREFIXES):
+        asset_mask = asset_prefix == asset
+        if not asset_mask.any():
+            continue
+
+        asset_df = df.loc[asset_mask].copy()
+        asset_df["property_key"] = property_keys.loc[asset_mask]
+
+        valid_mask = asset_df["property_key"] != PROPERTY_KEY_MISSING_VALUE
+        trade_df = asset_df[asset_df["src_type"].str.endswith("trade") & valid_mask]
+        lease_df = asset_df[asset_df["src_type"].str.endswith("lease") & valid_mask]
+
+        trade_props = set(trade_df["property_key"].unique())
+        lease_props = set(lease_df["property_key"].unique())
+        common_props = trade_props & lease_props
+
+        area_filtered_props: set[str] = set()
+        matched_props = set(common_props)
+
+        if "전용면적_㎡" in trade_df.columns and "전용면적_㎡" in lease_df.columns and common_props:
+            trade_medians = (
+                trade_df.groupby("property_key")["전용면적_㎡"].median()
+            )
+            lease_medians = (
+                lease_df.groupby("property_key")["전용면적_㎡"].median()
+            )
+            area_join = pd.concat(
+                [trade_medians.rename("trade_median"), lease_medians.rename("lease_median")],
+                axis=1,
+                join="inner",
+            )
+
+            def _area_ok(row: pd.Series) -> bool:
+                t = row.get("trade_median")
+                l = row.get("lease_median")
+                if pd.isna(t) or pd.isna(l):
+                    return True
+                if min(t, l) <= 0:
+                    return True
+                ratio = max(t, l) / min(t, l)
+                return ratio <= tolerance
+
+            area_join["area_ok"] = area_join.apply(_area_ok, axis=1)
+            matched_props = set(area_join.index[area_join["area_ok"]])
+            area_filtered_props = set(area_join.index[~area_join["area_ok"]])
+
+        matched_keys.update(matched_props)
+
+        stats.append(
+            {
+                "asset": asset,
+                "rows_total": int(asset_mask.sum()),
+                "rows_missing_property": int((asset_mask & (property_keys == PROPERTY_KEY_MISSING_VALUE)).sum()),
+                "properties_with_trade": len(trade_props),
+                "properties_with_lease": len(lease_props),
+                "properties_with_both": len(common_props),
+                "properties_area_filtered": len(area_filtered_props),
+                "matched_properties": len(matched_props),
+            }
+        )
+
+    return matched_keys, stats
 
 # ---------------------------------------------------------------------------
 # 데이터 구조
@@ -501,6 +711,9 @@ def ensure_area_column(df: pd.DataFrame) -> pd.DataFrame:
 def ensure_transaction_amount(df: pd.DataFrame) -> pd.DataFrame:
     if "거래금액_만원" not in df.columns:
         df["거래금액_만원"] = pd.NA
+    df["transaction_amount_imputed"] = pd.Series(False, index=df.index, dtype="boolean")
+    df["transaction_amount_from_trade"] = pd.Series(False, index=df.index, dtype="boolean")
+    df["transaction_amount_trade_diff_days"] = pd.Series(pd.NA, index=df.index, dtype="Int64")
     mask_amount = df["거래금액_만원"].isna() | (df["거래금액_만원"] <= 0)
     if mask_amount.any():
         deposit = df.get("보증금_만원")
@@ -513,6 +726,7 @@ def ensure_transaction_amount(df: pd.DataFrame) -> pd.DataFrame:
                 replacements = mask_amount & fallback_amount.notna()
                 if replacements.any():
                     df.loc[replacements, "거래금액_만원"] = fallback_amount.loc[replacements]
+                    df.loc[replacements, "transaction_amount_imputed"] = True
                     _log_imputation(df, "거래금액_만원", "fallback:deposit_plus_rent", int(replacements.sum()))
     return df
 
@@ -585,6 +799,533 @@ def enrich_contract_features(df: pd.DataFrame) -> pd.DataFrame:
     df["contract_stability_score"] = stability_score.astype(float)
 
     return df
+
+
+def propagate_contract_metrics_from_lease(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "contract_stability_score" not in df.columns:
+        return df
+    if "property_key" not in df.columns or "YYYYMM" not in df.columns or "src_type" not in df.columns:
+        return df
+
+    work = df.copy()
+    # Ensure comparable key types
+    work["property_key"] = work["property_key"].astype(str)
+    work["YYYYMM"] = pd.to_numeric(work["YYYYMM"], errors="coerce").astype("Int64")
+
+    lease_mask = work["src_type"].astype(str).str.endswith("_lease", na=False)
+    trade_mask = work["src_type"].astype(str).str.endswith("_trade", na=False)
+    if not lease_mask.any() or not trade_mask.any():
+        return df
+
+    metrics_cols = [
+        "contract_stability_score",
+        "contract_is_renewal",
+        "contract_extension_flag",
+    ]
+    lease_metrics = (
+        work.loc[lease_mask & work["property_key"].notna(), ["property_key", "YYYYMM", *metrics_cols]]
+        .groupby(["property_key", "YYYYMM"], dropna=False)
+        .mean()
+        .reset_index()
+    )
+    if lease_metrics.empty:
+        return df
+
+    rename_map = {col: f"{col}_lease_ref" for col in metrics_cols}
+    lease_metrics.rename(columns=rename_map, inplace=True)
+
+    work = work.merge(lease_metrics, on=["property_key", "YYYYMM"], how="left")
+    trade_mask = work["src_type"].astype(str).str.endswith("_trade", na=False)
+    for col in metrics_cols:
+        ref_col = f"{col}_lease_ref"
+        if ref_col not in work.columns:
+            continue
+        mask = trade_mask & work[ref_col].notna()
+        if mask.any():
+            if col in {"contract_is_renewal", "contract_extension_flag"}:
+                work.loc[mask, col] = (
+                    work.loc[mask, ref_col]
+                    .round()
+                    .astype("Int64")
+                )
+            else:
+                work.loc[mask, col] = work.loc[mask, ref_col]
+        work.drop(columns=[ref_col], inplace=True, errors="ignore")
+
+    return work
+
+
+# ---------------------------------------------------------------------------
+# 수익률 보강 유틸
+# ---------------------------------------------------------------------------
+
+
+def _compute_effective_monthly_rent(
+    deposit: Optional[pd.Series],
+    monthly: Optional[pd.Series],
+) -> pd.Series:
+    if deposit is not None:
+        deposit_series = deposit.fillna(0).astype(float)
+        index = deposit_series.index
+    else:
+        deposit_series = None
+        index = None
+
+    if monthly is not None:
+        monthly_series = monthly.fillna(0).astype(float)
+        index = monthly_series.index if index is None else index
+    else:
+        monthly_series = None
+
+    if index is None:
+        return pd.Series(dtype=float)
+
+    if deposit_series is None:
+        deposit_component = pd.Series(0.0, index=index)
+    else:
+        deposit_component = (deposit_series / K_CONVERSION).reindex(index, fill_value=0.0)
+
+    if monthly_series is None:
+        monthly_component = pd.Series(0.0, index=index)
+    else:
+        monthly_component = monthly_series.reindex(index, fill_value=0.0)
+
+    return deposit_component + monthly_component
+
+
+def _match_trade_with_lease(
+    trade_df: pd.DataFrame,
+    lease_df: pd.DataFrame,
+    *,
+    max_days: int,
+) -> pd.DataFrame:
+    if trade_df.empty or lease_df.empty:
+        return pd.DataFrame(columns=["trade_index", "lease_annual_rent", "date_diff_days"])
+
+    trade_cols = ["trade_index", "property_key", "asset_type", "계약일자_trade"]
+    lease_cols = ["property_key", "asset_type", "계약일자_lease", "lease_annual_rent"]
+    trade = trade_df.loc[:, trade_cols].copy()
+    lease = lease_df.loc[:, lease_cols].copy()
+
+    trade = trade.sort_values(["property_key", "asset_type", "계약일자_trade"]).reset_index(drop=True)
+    lease = lease.sort_values(["property_key", "asset_type", "계약일자_lease"]).reset_index(drop=True)
+    if trade.empty or lease.empty:
+        return pd.DataFrame(columns=["trade_index", "lease_annual_rent", "date_diff_days"])
+
+    lease_groups = {}
+    for key, sub in lease.groupby(["property_key", "asset_type"]):
+        sub = sub.dropna(subset=["계약일자_lease", "lease_annual_rent"])
+        if sub.empty:
+            continue
+        sub_sorted = sub.sort_values("계약일자_lease")
+        lease_groups[key] = (
+            sub_sorted["계약일자_lease"].to_numpy(dtype="datetime64[ns]"),
+            sub_sorted["lease_annual_rent"].to_numpy(dtype=float),
+        )
+
+    if not lease_groups:
+        return pd.DataFrame(columns=["trade_index", "lease_annual_rent", "date_diff_days"])
+
+    matches = []
+    for key, trades in trade.groupby(["property_key", "asset_type"]):
+        payload = lease_groups.get(key)
+        if payload is None:
+            continue
+        lease_dates, lease_rents = payload
+        if lease_dates.size == 0:
+            continue
+        for row in trades.itertuples(index=False):
+            trade_date = np.datetime64(row.계약일자_trade.to_datetime64())
+            delta_days = np.abs((lease_dates - trade_date).astype('timedelta64[D]')).astype(int)
+            within = delta_days <= max_days
+            if not np.any(within):
+                continue
+            min_delta = delta_days[within].min()
+            candidate_idx = np.flatnonzero(delta_days == min_delta)
+            chosen = candidate_idx[0]
+            matches.append((int(row.trade_index), float(lease_rents[chosen]), int(min_delta)))
+
+    if not matches:
+        return pd.DataFrame(columns=["trade_index", "lease_annual_rent", "date_diff_days"])
+
+    result = pd.DataFrame(matches, columns=["trade_index", "lease_annual_rent", "date_diff_days"])
+    return result
+
+def _match_lease_with_trade(
+    lease_df: pd.DataFrame,
+    trade_df: pd.DataFrame,
+    *,
+    max_days: int,
+) -> pd.DataFrame:
+    if lease_df.empty or trade_df.empty:
+        return pd.DataFrame(columns=["lease_index", "trade_amount", "date_diff_days"])
+
+    lease_cols = ["lease_index", "property_key", "asset_type", "계약일자_lease"]
+    trade_cols = ["property_key", "asset_type", "계약일자_trade", "trade_amount"]
+    lease = lease_df.loc[:, lease_cols].copy()
+    trade = trade_df.loc[:, trade_cols].copy()
+
+    trade_groups: Dict[Tuple[str, str], Tuple[np.ndarray, np.ndarray]] = {}
+    for key, sub in trade.groupby(["property_key", "asset_type"]):
+        sub = sub.dropna(subset=["계약일자_trade", "trade_amount"])
+        if sub.empty:
+            continue
+        sub_sorted = sub.sort_values("계약일자_trade")
+        trade_groups[key] = (
+            sub_sorted["계약일자_trade"].to_numpy(dtype="datetime64[ns]"),
+            sub_sorted["trade_amount"].to_numpy(dtype=float),
+        )
+
+    if not trade_groups:
+        return pd.DataFrame(columns=["lease_index", "trade_amount", "date_diff_days"])
+
+    matches: List[Tuple[int, float, int]] = []
+    for row in lease.itertuples(index=False):
+        key = (row.property_key, row.asset_type)
+        payload = trade_groups.get(key)
+        if payload is None:
+            continue
+        trade_dates, trade_amounts = payload
+        if trade_dates.size == 0:
+            continue
+        lease_date = getattr(row, "계약일자_lease", None)
+        if pd.isna(lease_date):
+            continue
+        lease_np = np.datetime64(lease_date.to_datetime64())
+        delta_days = np.abs(trade_dates - lease_np).astype('timedelta64[D]').astype(int)
+        within = delta_days <= max_days
+        if not np.any(within):
+            continue
+        min_delta = delta_days[within].min()
+        candidate_idx = np.flatnonzero(delta_days == min_delta)
+        chosen = candidate_idx[0]
+        matches.append((int(row.lease_index), float(trade_amounts[chosen]), int(min_delta)))
+
+    if not matches:
+        return pd.DataFrame(columns=["lease_index", "trade_amount", "date_diff_days"])
+
+    return pd.DataFrame(matches, columns=["lease_index", "trade_amount", "date_diff_days"])
+
+
+def enrich_lease_amount_from_trade(
+    df: pd.DataFrame,
+    *,
+    primary_days: int = YIELD_PRIMARY_WINDOW_DAYS,
+    secondary_days: int = YIELD_SECONDARY_WINDOW_DAYS,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    if df.empty or "거래금액_만원" not in df.columns:
+        return df, {}
+    if "src_type" not in df.columns or "property_key" not in df.columns:
+        return df, {}
+
+    if "transaction_amount_imputed" not in df.columns:
+        df["transaction_amount_imputed"] = pd.Series(False, index=df.index, dtype="boolean")
+    if "transaction_amount_from_trade" not in df.columns:
+        df["transaction_amount_from_trade"] = pd.Series(False, index=df.index, dtype="boolean")
+    if "transaction_amount_trade_diff_days" not in df.columns:
+        df["transaction_amount_trade_diff_days"] = pd.Series(pd.NA, index=df.index, dtype="Int64")
+
+    src_types = df["src_type"].astype("string")
+    asset_types = src_types.str.split("_", n=1).str[0]
+
+    lease_mask = src_types.str.endswith("lease")
+    trade_mask = src_types.str.endswith("trade")
+    if not lease_mask.any() or not trade_mask.any():
+        return df, {}
+
+    amount = df["거래금액_만원"]
+    imputed = df["transaction_amount_imputed"].fillna(False)
+    needs_mask = lease_mask & (amount.isna() | (amount <= 0) | imputed)
+    lease_candidates = df.loc[needs_mask].copy()
+    lease_candidates = lease_candidates[
+        lease_candidates["property_key"].notna()
+        & (lease_candidates["property_key"] != PROPERTY_KEY_MISSING_VALUE)
+        & lease_candidates["계약일자"].notna()
+    ]
+    if lease_candidates.empty:
+        return df, {}
+
+    trade_df = df.loc[trade_mask].copy()
+    trade_df = trade_df[
+        trade_df["거래금액_만원"].notna()
+        & (trade_df["거래금액_만원"] > 0)
+        & trade_df["property_key"].notna()
+        & (trade_df["property_key"] != PROPERTY_KEY_MISSING_VALUE)
+        & trade_df["계약일자"].notna()
+    ]
+    if trade_df.empty:
+        return df, {}
+
+    lease_candidates = lease_candidates.assign(
+        lease_index=lease_candidates.index,
+        asset_type=asset_types.loc[lease_candidates.index].values,
+        계약일자_lease=lease_candidates["계약일자"],
+    )
+    trade_df = trade_df.assign(
+        asset_type=asset_types.loc[trade_df.index].values,
+        계약일자_trade=trade_df["계약일자"],
+        trade_amount=trade_df["거래금액_만원"],
+    )
+
+    summary: Dict[str, Any] = {
+        "lease_candidates": int(len(lease_candidates)),
+        "window_primary_days": primary_days,
+        "window_secondary_days": secondary_days,
+    }
+
+    def _apply_matches(match_df: pd.DataFrame) -> int:
+        if match_df.empty:
+            return 0
+        idx = pd.Index(match_df["lease_index"].astype(df.index.dtype, copy=False))
+        df.loc[idx, "거래금액_만원"] = match_df["trade_amount"].values
+        df.loc[idx, "transaction_amount_imputed"] = False
+        df.loc[idx, "transaction_amount_from_trade"] = True
+        df.loc[idx, "transaction_amount_trade_diff_days"] = match_df["date_diff_days"].values
+        return int(len(match_df))
+
+    matches_primary = _match_lease_with_trade(lease_candidates, trade_df, max_days=primary_days)
+    resolved_primary = _apply_matches(matches_primary)
+    if resolved_primary:
+        summary["matched_trade_primary"] = resolved_primary
+
+    remaining_mask = lease_mask & df["transaction_amount_imputed"].fillna(False)
+    if remaining_mask.any():
+        secondary_candidates = df.loc[remaining_mask].copy()
+        secondary_candidates = secondary_candidates[
+            secondary_candidates["property_key"].notna()
+            & (secondary_candidates["property_key"] != PROPERTY_KEY_MISSING_VALUE)
+            & secondary_candidates["계약일자"].notna()
+        ]
+        if not secondary_candidates.empty:
+            secondary_candidates = secondary_candidates.assign(
+                lease_index=secondary_candidates.index,
+                asset_type=asset_types.loc[secondary_candidates.index].values,
+                계약일자_lease=secondary_candidates["계약일자"],
+            )
+            matches_secondary = _match_lease_with_trade(secondary_candidates, trade_df, max_days=secondary_days)
+            resolved_secondary = _apply_matches(matches_secondary)
+            if resolved_secondary:
+                summary["matched_trade_secondary"] = resolved_secondary
+
+    still_imputed = int(df.loc[lease_mask, "transaction_amount_imputed"].fillna(False).sum())
+    summary["lease_amount_from_trade"] = int(df.loc[lease_mask, "transaction_amount_from_trade"].fillna(False).sum())
+    summary["lease_amount_still_imputed"] = still_imputed
+
+    return df, summary
+
+
+def _prepare_group_rent_stats(lease_df: pd.DataFrame) -> Dict[str, Dict[tuple, float]]:
+    if lease_df.empty:
+        return {}
+
+    lease_df = lease_df.copy()
+    lease_df["sigungu_key"] = lease_df["sigungu"].fillna("미상").astype(str)
+    lease_df["sido_key"] = lease_df["sido"].fillna("미상").astype(str)
+    lease_df["area_bucket_key"] = lease_df["area_bucket"].astype("string").fillna("미상")
+
+    stats: Dict[str, Dict[tuple, float]] = {}
+    stats["asset_sigungu_area"] = (
+        lease_df.groupby(["asset_type", "sigungu_key", "area_bucket_key"], dropna=False)["lease_annual_rent"].mean().to_dict()
+    )
+    stats["asset_sido_area"] = (
+        lease_df.groupby(["asset_type", "sido_key", "area_bucket_key"], dropna=False)["lease_annual_rent"].mean().to_dict()
+    )
+    stats["asset_sigungu"] = (
+        lease_df.groupby(["asset_type", "sigungu_key"], dropna=False)["lease_annual_rent"].mean().to_dict()
+    )
+    stats["asset_sido"] = (
+        lease_df.groupby(["asset_type", "sido_key"], dropna=False)["lease_annual_rent"].mean().to_dict()
+    )
+    stats["asset"] = lease_df.groupby(["asset_type"], dropna=False)["lease_annual_rent"].mean().to_dict()
+    return stats
+
+
+def _lookup_group_annual_rent(
+    row: pd.Series,
+    stats: Dict[str, Dict[tuple, float]],
+) -> float | None:
+    asset = row.get("asset_type")
+    if not asset:
+        return None
+
+    sigungu = str(row.get("sigungu") or "미상")
+    sido = str(row.get("sido") or "미상")
+    area_bucket = row.get("area_bucket")
+    area_key = str(area_bucket) if pd.notna(area_bucket) else "미상"
+
+    keys = [
+        ("asset_sigungu_area", (asset, sigungu, area_key)),
+        ("asset_sido_area", (asset, sido, area_key)),
+        ("asset_sigungu", (asset, sigungu)),
+        ("asset_sido", (asset, sido)),
+        ("asset", (asset,)),
+    ]
+
+    for bucket, key in keys:
+        value = stats.get(bucket, {}).get(key)
+        if value and value > 0:
+            return float(value)
+    return None
+
+
+def enrich_trade_yield_from_rent(
+    df: pd.DataFrame,
+    *,
+    primary_days: int = YIELD_PRIMARY_WINDOW_DAYS,
+    secondary_days: int = YIELD_SECONDARY_WINDOW_DAYS,
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    summary: Dict[str, int] = {}
+    required_cols = {"src_type", "property_key", "계약일자", "추정매입가_만원", "Yield_%"}
+    if df.empty or not required_cols.issubset(df.columns):
+        return df, summary
+
+    if "yield_imputed" not in df.columns:
+        df["yield_imputed"] = pd.Series(False, index=df.index, dtype="boolean")
+    else:
+        df["yield_imputed"] = df["yield_imputed"].astype("boolean")
+
+    src_types = df["src_type"].astype(str)
+    asset_types = src_types.str.split("_", n=1).str[0]
+    trade_mask = src_types.str.endswith("trade")
+    lease_mask = src_types.str.endswith("lease")
+
+    trade_indices = df.index[trade_mask]
+    if trade_indices.empty:
+        return df, summary
+
+    lease_indices = df.index[lease_mask]
+    lease_df = df.loc[lease_indices].copy()
+    lease_df = lease_df[lease_df["property_key"].notna()]
+    lease_df = lease_df[lease_df["property_key"] != PROPERTY_KEY_MISSING_VALUE]
+    lease_df = lease_df[lease_df["계약일자"].notna()]
+
+    if lease_df.empty:
+        return df, summary
+
+    lease_df = lease_df.assign(
+        asset_type=asset_types.loc[lease_df.index].values,
+        effective_monthly=_compute_effective_monthly_rent(
+            lease_df.get("보증금_만원"),
+            lease_df.get("월세_만원"),
+        ),
+    )
+    lease_df["lease_annual_rent"] = lease_df["effective_monthly"] * 12
+    lease_df = lease_df[lease_df["lease_annual_rent"] > 0]
+    lease_df = lease_df.rename(columns={"계약일자": "계약일자_lease"})
+    lease_info = lease_df[[
+        "property_key",
+        "asset_type",
+        "계약일자_lease",
+        "lease_annual_rent",
+        "sido",
+        "sigungu",
+        "area_bucket",
+    ]].copy()
+
+    if lease_info.empty:
+        return df, summary
+
+    trade_df = df.loc[trade_indices].copy()
+    trade_df = trade_df[trade_df["추정매입가_만원"].notna() & (trade_df["추정매입가_만원"] > 0)]
+    trade_df = trade_df[trade_df["계약일자"].notna()]
+    if trade_df.empty:
+        return df, summary
+
+    trade_df = trade_df.assign(
+        asset_type=asset_types.loc[trade_df.index].values,
+        trade_index=trade_df.index,
+    )
+    trade_df = trade_df[trade_df["property_key"].notna()]
+    trade_df = trade_df[trade_df["property_key"] != PROPERTY_KEY_MISSING_VALUE]
+
+    if trade_df.empty:
+        return df, summary
+
+    existing_yield = df.loc[trade_df.index, "Yield_%"].fillna(0)
+    trade_needs = trade_df[existing_yield <= 0].copy()
+    if trade_needs.empty:
+        return df, summary
+
+    summary["trade_candidates"] = int(len(trade_needs))
+
+    trade_needs = trade_needs.rename(columns={"계약일자": "계약일자_trade"})
+
+    def _assign_yield_from_matches(matches: pd.DataFrame, *, imputed: bool) -> int:
+        if matches.empty:
+            return 0
+        idx = pd.Index(matches["trade_index"].astype(df.index.dtype, copy=False))
+        numerator = pd.Series(matches["lease_annual_rent"].values, index=idx)
+        denominator = df.loc[idx, "추정매입가_만원"]
+        yields = safe_divide(numerator, denominator) * 100
+        valid = yields.notna() & (yields > 0)
+        if not valid.any():
+            return 0
+        valid_indices = valid.index[valid]
+        df.loc[valid_indices, "Yield_%"] = yields.loc[valid]
+        df.loc[valid_indices, "yield_imputed"] = imputed
+        return int(valid.sum())
+
+    matched_primary = _match_trade_with_lease(trade_needs, lease_info, max_days=primary_days)
+    resolved_primary = _assign_yield_from_matches(matched_primary, imputed=False)
+    if resolved_primary:
+        summary["matched_property_primary"] = resolved_primary
+
+    unresolved_mask = df.loc[trade_needs["trade_index"], "Yield_%"].fillna(0) <= 0
+    unresolved_indices = pd.Index(trade_needs.loc[unresolved_mask.values, "trade_index"])
+
+    if not unresolved_indices.empty:
+        trade_secondary = trade_needs.loc[trade_needs["trade_index"].isin(unresolved_indices)].copy()
+        matched_secondary = _match_trade_with_lease(trade_secondary, lease_info, max_days=secondary_days)
+        resolved_secondary = _assign_yield_from_matches(matched_secondary, imputed=False)
+        if resolved_secondary:
+            summary["matched_property_secondary"] = resolved_secondary
+
+        unresolved_mask = df.loc[trade_needs["trade_index"], "Yield_%"].fillna(0) <= 0
+        unresolved_indices = pd.Index(trade_needs.loc[unresolved_mask.values, "trade_index"])
+
+    if not unresolved_indices.empty:
+        trade_final = trade_needs.loc[trade_needs["trade_index"].isin(unresolved_indices)].copy()
+        group_stats = _prepare_group_rent_stats(lease_info)
+        aggregated: Dict[int, float] = {}
+        for _, row in trade_final.iterrows():
+            annual = _lookup_group_annual_rent(row, group_stats)
+            if annual and annual > 0:
+                aggregated[int(row["trade_index"])] = float(annual)
+        if aggregated:
+            idx = pd.Index(list(aggregated.keys()))
+            numerator = pd.Series(list(aggregated.values()), index=idx)
+            denominator = df.loc[idx, "추정매입가_만원"]
+            yields = safe_divide(numerator, denominator) * 100
+            valid = yields.notna() & (yields > 0)
+            if valid.any():
+                valid_indices = valid.index[valid]
+                df.loc[valid_indices, "Yield_%"] = yields.loc[valid]
+                df.loc[valid_indices, "yield_imputed"] = True
+                summary["imputed_group_average"] = int(valid.sum())
+
+        unresolved_mask = df.loc[trade_needs["trade_index"], "Yield_%"].fillna(0) <= 0
+        unresolved_indices = pd.Index(trade_needs.loc[unresolved_mask.values, "trade_index"])
+
+    if not unresolved_indices.empty:
+        summary["unresolved_trade"] = int(len(unresolved_indices))
+        df.loc[unresolved_indices, "Yield_%"] = np.nan
+
+    post_yield = df.loc[trade_needs["trade_index"], "Yield_%"]
+    resolved_mask = post_yield.notna() & (post_yield > 0)
+    resolved_count = int(resolved_mask.sum())
+    if resolved_count:
+        summary["resolved_trade"] = resolved_count
+    trade_candidates = summary.get("trade_candidates", 0)
+    if trade_candidates:
+        coverage = resolved_count / trade_candidates
+        summary["yield_calc_coverage"] = round(float(coverage), 4)
+    else:
+        summary["yield_calc_coverage"] = 0.0
+    summary["yield_imputed_true"] = int(
+        df.loc[trade_needs["trade_index"], "yield_imputed"].fillna(False).sum()
+    )
+
+    return df, summary
 
 
 def safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
@@ -692,6 +1433,7 @@ def preprocess_dataframe(raw_df: pd.DataFrame, *, src_type: str) -> pd.DataFrame
     _init_metadata(df)
     df = ensure_required_columns(df)
     df = clean_address_tokens(df)
+    df = add_lot_components(df)
     df = normalize_region_columns(df)
     df["src_type"] = src_type
 
@@ -906,12 +1648,25 @@ def add_dimension_keys(df: pd.DataFrame) -> pd.DataFrame:
         df["건축년도"] = pd.NA
     if "층" not in df.columns:
         df["층"] = pd.NA
-    if "시도" in df.columns:
-        df["sido"] = df["시도"]
-    if "시군구" in df.columns:
-        df["sigungu"] = df["시군구"]
-    if "읍면동" in df.columns:
-        df["eupmyeondong"] = df["읍면동"]
+    # ?? ??? ?? ??? ??? ??? ????, ?? ?? ?? ?? ????.
+    df = normalize_region_columns(df)
+
+    region_fallbacks = (
+        ("sido", "시도"),
+        ("sigungu", "시군구"),
+        ("eupmyeondong", "읍면동"),
+    )
+    for normalized, original in region_fallbacks:
+        if normalized not in df.columns and original in df.columns:
+            df[normalized] = df[original]
+        if normalized not in df.columns:
+            df[normalized] = ""
+        series = df[normalized].astype(str).str.strip()
+        series = series.replace({"nan": "", "NaN": "", "None": ""})
+        if original in df.columns:
+            fallback = df[original].astype(str).str.strip()
+            series = series.mask(series.eq(""), fallback)
+        df[normalized] = series.replace("", "미상").fillna("미상")
     df["geo_hash"] = df.apply(build_geo_hash, axis=1)
     df["date_key"] = df["계약일자"].dt.strftime("%Y%m%d").astype("Int64")
     building_attrs = df[["건축년도", "층"]].copy().fillna(-1).astype(int)
@@ -920,6 +1675,7 @@ def add_dimension_keys(df: pd.DataFrame) -> pd.DataFrame:
         .agg("|".join, axis=1)
         .map(lambda x: hashlib.md5(x.encode("utf-8")).hexdigest())
     )
+    df = append_property_key(df)
     return df
 
 
@@ -938,11 +1694,14 @@ def compute_monthly_basics(df: pd.DataFrame) -> pd.DataFrame:
             avg_p_per_m2=("가격_per_㎡", "mean"),
             std_p_per_m2=("가격_per_㎡", "std"),
             avg_yield_pct=("Yield_%", "mean"),
+            avg_contract_stability=("contract_stability_score", "mean"),
             cancel_rate=("취소여부", "mean"),
         )
         .reset_index()
     )
     monthly["std_p_per_m2"] = monthly["std_p_per_m2"].fillna(0)
+    if "avg_contract_stability" in monthly.columns:
+        monthly["avg_contract_stability"] = monthly["avg_contract_stability"].fillna(0)
     monthly["cancel_rate"] = monthly["cancel_rate"].fillna(0)
     return monthly.loc[:, ~monthly.columns.str.fullmatch("index")].reset_index(drop=True)
 
@@ -967,8 +1726,52 @@ def compute_volatility(monthly: pd.DataFrame) -> pd.DataFrame:
     vol = monthly.copy()
     vol["cv_p_per_m2"] = vol["std_p_per_m2"] / vol["avg_p_per_m2"].replace(0, np.nan)
     vol["cv_p_per_m2"] = vol["cv_p_per_m2"].replace([np.inf, -np.inf], np.nan).fillna(0)
+    if "avg_contract_stability" in vol.columns:
+        vol["stability"] = vol["avg_contract_stability"].fillna(0)
+    elif "contract_stability_score" in vol.columns:
+        vol["stability"] = vol["contract_stability_score"].fillna(0)
+    else:
+        vol["stability"] = 0.0
     vol = vol.loc[:, ~vol.columns.str.fullmatch("index")]  # ensure index column removed
     return vol.reset_index(drop=True)
+
+
+def build_property_matched_dataset(
+    df: pd.DataFrame, *, tolerance: float = PROPERTY_MATCH_TOLERANCE
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    if df.empty or "property_key" not in df.columns:
+        return pd.DataFrame(), {}
+
+    property_keys = df["property_key"].fillna(PROPERTY_KEY_MISSING_VALUE)
+    asset_prefix = df["src_type"].astype(str).str.split("_", n=1).str[0]
+
+    matched_keys, asset_stats = _compute_property_match_stats(df, tolerance)
+    if not asset_stats:
+        return pd.DataFrame(), {}
+
+    dual_mask = asset_prefix.isin(DUAL_PROPERTY_PREFIXES)
+    matched_mask = df["property_key"].isin(matched_keys)
+    retain_mask = ~dual_mask | (dual_mask & matched_mask)
+
+    combined_df = df.loc[retain_mask].copy()
+
+    for entry in asset_stats:
+        asset = entry["asset"]
+        asset_mask = asset_prefix == asset
+        entry["row_retained"] = int((asset_mask & retain_mask).sum())
+        entry["row_dropped"] = int(entry["rows_total"] - entry["row_retained"])
+
+    summary: Dict[str, Any] = {
+        "tolerance_ratio": tolerance,
+        "rows_total": int(dual_mask.sum()),
+        "rows_retained": int((dual_mask & retain_mask).sum()),
+        "rows_dropped": int((dual_mask & (~retain_mask)).sum()),
+        "rows_missing_property": int((dual_mask & (property_keys == PROPERTY_KEY_MISSING_VALUE)).sum()),
+        "matched_properties": int(sum(entry.get("matched_properties", 0) for entry in asset_stats)),
+        "assets": asset_stats,
+    }
+
+    return combined_df, summary
 
 
 def sanitize_for_parquet(df: pd.DataFrame) -> pd.DataFrame:
@@ -1163,9 +1966,31 @@ def main() -> None:
 
     tidy = add_dimension_keys(tidy)
 
+    tidy, lease_amount_summary = enrich_lease_amount_from_trade(tidy)
+    if lease_amount_summary:
+        QUALITY_LOGS.append({"file": "__lease_amount_enrichment__", **lease_amount_summary})
+
+    tidy, yield_summary = enrich_trade_yield_from_rent(tidy)
+    if yield_summary:
+        QUALITY_LOGS.append({"file": "__yield_enrichment__", **yield_summary})
+
+    tidy = propagate_contract_metrics_from_lease(tidy)
+
+    combined_tidy, match_summary = build_property_matched_dataset(tidy)
+    if not combined_tidy.empty:
+        combined_tidy = propagate_contract_metrics_from_lease(combined_tidy)
+
     monthly = compute_monthly_basics(tidy)
     momentum = compute_momentum(monthly.copy())
     volatility = compute_volatility(monthly.copy())
+
+    combined_monthly = pd.DataFrame()
+    combined_momentum = pd.DataFrame()
+    combined_volatility = pd.DataFrame()
+    if not combined_tidy.empty:
+        combined_monthly = compute_monthly_basics(combined_tidy)
+        combined_momentum = compute_momentum(combined_monthly.copy())
+        combined_volatility = compute_volatility(combined_monthly.copy())
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     export_cols = [c for c in TRANSACTION_EXPORT_COLUMNS if c in tidy.columns]
@@ -1173,6 +1998,29 @@ def main() -> None:
     persist_parquet(monthly, args.output_dir / "monthly_basics.parquet")
     persist_parquet(momentum, args.output_dir / "monthly_momentum.parquet")
     persist_parquet(volatility, args.output_dir / "monthly_volatility.parquet")
+
+    if not combined_tidy.empty:
+        combined_export_cols = [c for c in TRANSACTION_EXPORT_COLUMNS if c in combined_tidy.columns]
+        persist_transactions_csv(
+            combined_tidy[combined_export_cols],
+            args.output_dir / "transactions_combined.csv",
+        )
+        persist_parquet(combined_monthly, args.output_dir / "monthly_basics_combined.parquet")
+        persist_parquet(combined_momentum, args.output_dir / "monthly_momentum_combined.parquet")
+        persist_parquet(
+            combined_volatility,
+            args.output_dir / "monthly_volatility_combined.parquet",
+        )
+
+    if match_summary:
+        QUALITY_LOGS.append(
+            {
+                "file": "__property_matching__",
+                "rows": int(len(tidy)),
+                "retained_rows": int(len(combined_tidy)),
+                "match": match_summary,
+            }
+        )
 
     if QUALITY_LOGS:
         persist_quality_report(args.output_dir / "quality_report.json", QUALITY_LOGS)

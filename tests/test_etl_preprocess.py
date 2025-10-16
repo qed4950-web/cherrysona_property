@@ -41,6 +41,9 @@ def test_preprocess_dataframe_parses_cancel_date_and_yield_guard():
     assert processed["가격_per_㎡"].iloc[0] == pytest.approx(200.0)
     assert not np.isinf(processed["Yield_%"].iloc[0])
     assert processed["floor_insight_enabled"].iloc[0] == 1
+    assert bool(processed["transaction_amount_imputed"].iloc[0]) is False
+    assert bool(processed["transaction_amount_from_trade"].iloc[0]) is False
+    assert pd.isna(processed["transaction_amount_trade_diff_days"].iloc[0])
 
 
 def test_preprocess_fallback_for_rent_only_and_area_alternative():
@@ -65,6 +68,9 @@ def test_preprocess_fallback_for_rent_only_and_area_alternative():
     assert processed["전용면적_㎡"].iloc[0] == pytest.approx(80.0)
     assert processed["가격_per_㎡"].iloc[0] == pytest.approx((5_000 + 50 * 100) / 80)
     assert processed["floor_insight_enabled"].iloc[0] == 1
+    assert bool(processed["transaction_amount_imputed"].iloc[0]) is True
+    assert bool(processed["transaction_amount_from_trade"].iloc[0]) is False
+    assert pd.isna(processed["transaction_amount_trade_diff_days"].iloc[0])
 
 
 def test_floor_insight_disabled_for_comm_trade():
@@ -85,3 +91,23 @@ def test_floor_insight_disabled_for_comm_trade():
 
     assert processed["floor_insight_enabled"].iloc[0] == 0
     assert processed["floor_bucket"].isna().all()
+
+
+def test_preprocess_dataframe_handles_combined_area_alias():
+    raw = pd.DataFrame(
+        {
+            "시도": ["서울특별시"],
+            "시군구": ["서초구"],
+            "읍면동": ["반포동"],
+            "계약년월": [202401],
+            "계약일": [10],
+            "거래금액(만원)": ["25,000"],
+            "전용/연면적(㎡)": [84.32],
+            "층": [15],
+        }
+    )
+
+    processed = preprocess_dataframe(raw, src_type="apt_trade")
+
+    assert "전용면적_㎡" in processed.columns
+    assert processed["전용면적_㎡"].iloc[0] == pytest.approx(84.32)

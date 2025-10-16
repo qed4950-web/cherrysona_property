@@ -1,0 +1,94 @@
+> 걱정 마세요. 정말 간단히 정리해볼게요.
+                                                      
+  ———                                                 
+                                                      
+  1. 데이터 어디 있나요?                              
+                                                      
+  - 원본 CSV는 data/raw 안에 있어요. (apt_trade 같은  
+  폴더)                                               
+  - 최근 데이터만 따로 쓰고 싶으면 data/              
+  raw_incremental에 복사해 두면 됩니다.               
+                                                      
+  2. ETL 어떻게 돌리나요?                             
+  터미널에서 두 번만 실행하면 끝나요.                 
+                                                      
+  # 전체 데이터 → 중간 결과                           
+  .venv/bin/python src/etl_realestate.py --data-root  
+  data/raw --output-dir data/processed/final_run      
+                                                      
+  # (선택) 최신 CSV만 따로 돌렸다면, 위 결과와 합치기 
+  .venv/bin/python src/etl_realestate.py --data-root  
+  data/raw_incremental --output-dir data/processed/   
+  final_incremental                                   
+  .venv/bin/python scripts/                           
+  merge_processed_with_incremental.py --base data/    
+  processed/final_run --incremental data/processed/   
+  final_incremental --output data/processed/          
+  final_release                                       
+                                                      
+  3. 나온 결과는 어디 있나요?                         
+                                                      
+  - 최종 버전은 data/processed/final_release/예요.    
+      - transactions.csv : 모든 거래                  
+      - monthly_basics.parquet : 월별 집계            
+      - monthly_momentum.parquet /                    
+  monthly_volatility.parquet : 모멘텀·변동성          
+      - quality_report.json : 품질 로그               
+                                                      
+  4. 대시보드 대신 빠르게 확인하려면?                 
+  Streamlit 못 써도 괜찮아요. 아래 명령 한 번이면 대시
+  보드가 필요한 컬럼/결측률/샘플을 알아서 뽑아줘요.   
+                                                      
+  .venv/bin/python scripts/mock_dashboard_checks.py \ 
+    --processed data/processed/final_release \        
+    --out diagnostics/                                
+  dashboard_contract_final_release.md \               
+    --samples-out diagnostics/                        
+  dashboard_contract_samples_final_release.csv        
+                                                      
+  5. 결과로 뭘 하면 되나요?                           
+                                                      
+  - 발표나 분석 자료는 data/processed/final_release 기
+  준으로 만들면 최신 데이터가 들어가요.               
+  - 검증 로그는 diagnostics/ 안에 쌓여요. 발표 준비   
+  할 때 docs/compatibility_final_summary.md랑 docs/   
+  compatibility_final_risks.md만 참고해도 흐름이 잡   
+  혀요.                                               
+                                                      
+  필요하면 언제든지 “1️⃣ Raw → 2️⃣ ETL → 3️⃣ (선택) 증      분 병                                                 
+  합 → 4️⃣ 최종 폴더 확인 → 5️⃣ 대시보드 체크” 이 순서    만                                                    
+  떠올리면 됩니다.      
+
+
+  네, 지금 final_release 기준으로 모든 검증을 끝냈으니
+  바로 대시보드 실행해도 됩니다.                      
+                                                      
+  - 데이터: data/processed/final_release/             
+  transactions.csv가 2024년 12월까지 들어 있습니다.   
+  - 검증 상태                                         
+      - 스키마/결측: diagnostics/                     
+  processed_contract_final_release.json에서 핵심 숫자 
+  컬럼 Null‧음수 0% 확인.                             
+      - 참조 매핑: diagnostics/                       
+  reference_alignment_final_release.csv에서 시군구 매 
+  칭 100%.                                            
+      - 대시보드 계약: diagnostics/                   
+  dashboard_contract_final_release.md 결과 이상 없음  
+  (단, floor_bucket 결측 43.7%는 비층형 상품 때문이고 
+  기존처럼 안내 배지만 유지하면 됩니다).              
+      - CSV 경고도 전부 제거했습니다.                 
+                                                      
+  Streamlit 실행 명령 예시는 아래처럼 맞춰 사용하시면 
+  됩니다(실제 파일 경로/비밀키 설정은 환경에 맞게):   
+                                                      
+  .venv/bin/python -m streamlit run app/              
+  dashboard_unified.py \                              
+    -- --data-root data/processed/final_release       
+                                                      
+  (만약 app/dashboard_unified.py에서 데이터 경로를    
+  옵션이나 config.toml로 읽어가면 그 방식에 맞춰 주   
+  세요.)                                              
+                                                      
+  요약하면: 최신 데이터 + 검증 OK → 지금 바로 대시보드
+  띄워도 문제 없습니다.                                       
+                      

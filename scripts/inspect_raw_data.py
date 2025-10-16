@@ -44,6 +44,11 @@ NUMERIC_COLUMNS = (
     "계약일",
 )
 
+AREA_FALLBACK_COLUMNS = (
+    "연면적_㎡",
+    "대지면적_㎡",
+)
+
 COL_ALIASES: Dict[str, str] = {
     alias: canonical
     for canonical, aliases in {
@@ -53,7 +58,16 @@ COL_ALIASES: Dict[str, str] = {
         "법정동코드": ["법정동코드", "법정동 코드", "법정코드"],
         "건축년도": ["건축년도", "건축 연도", "준공년도"],
         "층": ["층", "해당층"],
-        "전용면적_㎡": ["전용면적(㎡)", "전용면적", "면적(㎡)", "계약면적", "계약면적(㎡)", "계약면적_㎡"],
+        "전용면적_㎡": [
+            "전용면적(㎡)",
+            "전용면적",
+            "면적(㎡)",
+            "계약면적",
+            "계약면적(㎡)",
+            "계약면적_㎡",
+            "전용/연면적(㎡)",
+            "전용/연면적",
+        ],
         "연면적_㎡": ["연면적", "연면적(㎡)", "연면적_㎡"],
         "대지면적_㎡": ["대지면적", "대지면적(㎡)", "대지 면적"],
         "거래금액_만원": ["거래금액(만원)", "거래금액", "금액(만원)", "매매금액(만원)"],
@@ -137,6 +151,10 @@ def inspect_file(path: Path) -> Dict[str, Any]:
     }
 
     missing = [col for col in ESSENTIAL_COLUMNS if col not in df.columns]
+    if "전용면적_㎡" in missing:
+        fallback_present = any(col in df.columns for col in AREA_FALLBACK_COLUMNS)
+        if fallback_present:
+            missing = [col for col in missing if col != "전용면적_㎡"]
     if missing:
         entry["missing_columns"] = missing
 

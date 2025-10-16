@@ -1,0 +1,37 @@
+{
+  "current": {
+    "path": "/mnt/c/python/github/부동산1차/cherrysona_property/diagnostics/etl_final.log",
+    "size_bytes": 1349,
+    "line_count": 26,
+    "warn_count": 0,
+    "error_count": 0,
+    "traceback_count": 0,
+    "elapsed_seconds": 1029.96,
+    "user_seconds": 920.23,
+    "system_seconds": 46.92,
+    "max_rss_kb": 15815632.0
+  },
+  "baseline": {
+    "path": "/mnt/c/python/github/부동산1차/cherrysona_property/diagnostics/etl_baseline.log",
+    "size_bytes": 1349,
+    "line_count": 26,
+    "warn_count": 0,
+    "error_count": 0,
+    "traceback_count": 0,
+    "elapsed_seconds": 1029.96,
+    "user_seconds": 920.23,
+    "system_seconds": 46.92,
+    "max_rss_kb": 15815632.0
+  },
+  "diff": {
+    "warn_count": 0.0,
+    "traceback_count": 0.0,
+    "user_seconds": 0.0,
+    "system_seconds": 0.0,
+    "elapsed_seconds": 0.0,
+    "error_count": 0.0,
+    "size_bytes": 0.0,
+    "max_rss_kb": 0.0,
+    "line_count": 0.0
+  }
+}

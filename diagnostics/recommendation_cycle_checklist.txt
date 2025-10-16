@@ -1,0 +1,4 @@
+- `app/dashboard_unified.py`는 sklearn 기반 KMeans/RandomForest/DecisionTree를 조건부 임포트하므로, 추천 탭 실행 전 해당 패키지가 설치돼 있어야 합니다.
+- Streamlit 캐시(`st.cache_resource`, `st.cache_data`)가 데이터 로딩과 모델 학습 함수에 적용되어 반복 실행 비용을 줄입니다.
+- 추천 사이클이 의존하는 데이터프레임(`load_compare_base`, `prepare_radar_frame`)은 앞서 확인한 전처리 컬럼(`transaction_amount_from_trade`, `Yield_%`, `mom_3m`, 등)을 요구하며, 현재 산출물에서 존재함을 검증했습니다.
+- 시각화(Altair, pydeck)도 필수 의존성이므로 `pip install -r requirements.txt` 방식으로 선 설치가 필요합니다.
